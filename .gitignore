@@ -4,3 +4,4 @@ report_ascii_compliance.txt
 .DS_Store
 report_bandit.txt
 report_pyright.txt
+/target

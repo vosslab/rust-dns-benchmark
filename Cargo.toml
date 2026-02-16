@@ -1,0 +1,16 @@
+[package]
+name = "rust-dns-benchmark"
+version = "26.2.0"
+edition = "2021"
+description = "A CLI tool that benchmarks DNS resolver performance over UDP"
+license = "GPL-3.0"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hickory-proto = "0.25"
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+comfy-table = "7"
+csv = "1"
+anyhow = "1"
+thiserror = "1"
