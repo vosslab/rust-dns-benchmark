@@ -1,4 +1,4 @@
-/// Statistics for a set of queries (warm or cold)
+/// Statistics for a set of queries (warm, cold, or tld)
 #[derive(Debug, Clone, Default)]
 pub struct SetStats {
 	pub p50_ms: f64,
@@ -11,14 +11,17 @@ pub struct SetStats {
 	pub score: f64,
 }
 
-/// Full resolver statistics with warm and cold sets
+/// Full resolver statistics with warm, cold, and TLD sets
 #[derive(Debug, Clone)]
 pub struct ResolverStats {
 	pub label: String,
+	pub addr: String,
 	pub warm: SetStats,
 	pub cold: SetStats,
+	pub tld: Option<SetStats>,
 	pub overall_score: f64,
 	pub success_rate: f64,
+	pub intercepts_nxdomain: bool,
 }
 
 /// Scored and ranked resolver
@@ -26,6 +29,8 @@ pub struct ResolverStats {
 pub struct ScoredResolver {
 	pub rank: usize,
 	pub stats: ResolverStats,
+	/// Tie group label (e.g. "1-3") when resolvers are statistically tied
+	pub tie_group: Option<String>,
 }
 
 /// Calculate the p-th percentile from a sorted slice using nearest-rank method.
@@ -111,6 +116,88 @@ pub fn compute_set_stats(
 	stats
 }
 
+/// Compute the uncertainty of a score using MAD (median absolute deviation).
+///
+/// Uses the scale factor 1.4826 for consistency with normal distribution.
+/// Returns the uncertainty band half-width for the given latencies.
+pub fn compute_uncertainty(latencies_ms: &[f64]) -> f64 {
+	if latencies_ms.len() < 2 {
+		return 0.0;
+	}
+	let mut sorted = latencies_ms.to_vec();
+	sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+	let median = percentile(&sorted, 50.0).unwrap_or(0.0);
+
+	// Compute absolute deviations from median
+	let mut abs_devs: Vec<f64> = sorted.iter()
+		.map(|v| (v - median).abs())
+		.collect();
+	abs_devs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+	// MAD = median of absolute deviations
+	let mad = percentile(&abs_devs, 50.0).unwrap_or(0.0);
+
+	// Scale factor for normal distribution consistency
+	1.4826 * mad
+}
+
+/// Detect ties among ranked resolvers based on overlapping uncertainty bands.
+///
+/// For consecutive pairs: if |score_a - score_b| < uncertainty_a + uncertainty_b,
+/// they are tied. Groups tied resolvers and assigns shared rank labels.
+pub fn detect_ties(resolvers: &mut [ScoredResolver], uncertainties: &[f64]) {
+	if resolvers.len() < 2 || uncertainties.len() != resolvers.len() {
+		return;
+	}
+
+	// Build tie groups using a union-find approach on consecutive pairs
+	let n = resolvers.len();
+	let mut group_id = vec![0usize; n];
+	for i in 0..n {
+		group_id[i] = i;
+	}
+
+	// Check consecutive pairs for overlap
+	for i in 0..(n - 1) {
+		let score_a = resolvers[i].stats.overall_score;
+		let score_b = resolvers[i + 1].stats.overall_score;
+		let diff = (score_a - score_b).abs();
+		let threshold = uncertainties[i] + uncertainties[i + 1];
+
+		if diff < threshold {
+			// Merge into same group (use the earlier group ID)
+			let target = group_id[i];
+			let source = group_id[i + 1];
+			// Propagate group membership
+			for g in group_id.iter_mut() {
+				if *g == source {
+					*g = target;
+				}
+			}
+		}
+	}
+
+	// Convert group IDs to rank labels
+	let mut i = 0;
+	while i < n {
+		let gid = group_id[i];
+		// Find all members of this group
+		let members: Vec<usize> = (0..n).filter(|&j| group_id[j] == gid).collect();
+
+		if members.len() > 1 {
+			let first_rank = members[0] + 1;
+			let last_rank = members[members.len() - 1] + 1;
+			let label = format!("{}-{}", first_rank, last_rank);
+			for &m in &members {
+				resolvers[m].tie_group = Some(label.clone());
+			}
+		}
+
+		i = members.last().map(|&l| l + 1).unwrap_or(i + 1);
+	}
+}
+
 /// Rank resolvers by overall score (average of warm and cold scores), ascending.
 ///
 /// Lower scores are better (lower latency).
@@ -125,6 +212,7 @@ pub fn rank_resolvers(mut resolvers: Vec<ResolverStats>) -> Vec<ScoredResolver> 
 		.map(|(i, stats)| ScoredResolver {
 			rank: i + 1,
 			stats,
+			tie_group: None,
 		})
 		.collect()
 }
@@ -207,24 +295,33 @@ mod tests {
 		let resolvers = vec![
 			ResolverStats {
 				label: "slow".to_string(),
+				addr: "0.0.0.0".to_string(),
 				warm: SetStats::default(),
 				cold: SetStats::default(),
+				tld: None,
 				overall_score: 100.0,
 				success_rate: 95.0,
+				intercepts_nxdomain: false,
 			},
 			ResolverStats {
 				label: "fast".to_string(),
+				addr: "0.0.0.0".to_string(),
 				warm: SetStats::default(),
 				cold: SetStats::default(),
+				tld: None,
 				overall_score: 10.0,
 				success_rate: 99.0,
+				intercepts_nxdomain: false,
 			},
 			ResolverStats {
 				label: "medium".to_string(),
+				addr: "0.0.0.0".to_string(),
 				warm: SetStats::default(),
 				cold: SetStats::default(),
+				tld: None,
 				overall_score: 50.0,
 				success_rate: 97.0,
+				intercepts_nxdomain: false,
 			},
 		];
 		let ranked = rank_resolvers(resolvers);
@@ -234,5 +331,124 @@ mod tests {
 		assert_eq!(ranked[1].stats.label, "medium");
 		assert_eq!(ranked[2].rank, 3);
 		assert_eq!(ranked[2].stats.label, "slow");
+	}
+
+	#[test]
+	fn test_compute_uncertainty_basic() {
+		// Symmetric data: deviations from median=5 are [4,3,2,1,0,1,2,3,4]
+		let values = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+		let uncertainty = compute_uncertainty(&values);
+		// MAD of abs deviations [0,1,1,2,2,3,3,4,4] = median = 2
+		// uncertainty = 1.4826 * 2 = 2.9652
+		assert!((uncertainty - 2.9652).abs() < 0.01);
+	}
+
+	#[test]
+	fn test_compute_uncertainty_single() {
+		let values = vec![42.0];
+		assert_eq!(compute_uncertainty(&values), 0.0);
+	}
+
+	#[test]
+	fn test_compute_uncertainty_empty() {
+		let values: Vec<f64> = vec![];
+		assert_eq!(compute_uncertainty(&values), 0.0);
+	}
+
+	#[test]
+	fn test_detect_ties_close_scores() {
+		let mut resolvers = vec![
+			ScoredResolver {
+				rank: 1,
+				stats: ResolverStats {
+					label: "a".to_string(),
+					addr: "0.0.0.0".to_string(),
+					warm: SetStats::default(),
+					cold: SetStats::default(),
+					tld: None,
+					overall_score: 10.0,
+					success_rate: 99.0,
+					intercepts_nxdomain: false,
+				},
+				tie_group: None,
+			},
+			ScoredResolver {
+				rank: 2,
+				stats: ResolverStats {
+					label: "b".to_string(),
+					addr: "0.0.0.0".to_string(),
+					warm: SetStats::default(),
+					cold: SetStats::default(),
+					tld: None,
+					overall_score: 11.0,
+					success_rate: 98.0,
+					intercepts_nxdomain: false,
+				},
+				tie_group: None,
+			},
+			ScoredResolver {
+				rank: 3,
+				stats: ResolverStats {
+					label: "c".to_string(),
+					addr: "0.0.0.0".to_string(),
+					warm: SetStats::default(),
+					cold: SetStats::default(),
+					tld: None,
+					overall_score: 50.0,
+					success_rate: 95.0,
+					intercepts_nxdomain: false,
+				},
+				tie_group: None,
+			},
+		];
+		// Large uncertainties for a and b, small for c
+		let uncertainties = vec![5.0, 5.0, 0.1];
+		detect_ties(&mut resolvers, &uncertainties);
+
+		// a and b should be tied (diff=1, threshold=10)
+		assert_eq!(resolvers[0].tie_group, Some("1-2".to_string()));
+		assert_eq!(resolvers[1].tie_group, Some("1-2".to_string()));
+		// c should not be tied
+		assert_eq!(resolvers[2].tie_group, None);
+	}
+
+	#[test]
+	fn test_detect_ties_no_ties() {
+		let mut resolvers = vec![
+			ScoredResolver {
+				rank: 1,
+				stats: ResolverStats {
+					label: "a".to_string(),
+					addr: "0.0.0.0".to_string(),
+					warm: SetStats::default(),
+					cold: SetStats::default(),
+					tld: None,
+					overall_score: 10.0,
+					success_rate: 99.0,
+					intercepts_nxdomain: false,
+				},
+				tie_group: None,
+			},
+			ScoredResolver {
+				rank: 2,
+				stats: ResolverStats {
+					label: "b".to_string(),
+					addr: "0.0.0.0".to_string(),
+					warm: SetStats::default(),
+					cold: SetStats::default(),
+					tld: None,
+					overall_score: 100.0,
+					success_rate: 95.0,
+					intercepts_nxdomain: false,
+				},
+				tie_group: None,
+			},
+		];
+		// Very small uncertainties
+		let uncertainties = vec![0.1, 0.1];
+		detect_ties(&mut resolvers, &uncertainties);
+
+		assert_eq!(resolvers[0].tie_group, None);
+		assert_eq!(resolvers[1].tie_group, None);
 	}
 }

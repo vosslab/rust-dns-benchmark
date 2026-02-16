@@ -6,6 +6,8 @@ use std::time::Duration;
 pub struct ResolverConfig {
 	pub label: String,
 	pub addr: SocketAddr,
+	/// Whether the resolver intercepts NXDOMAIN (set during characterization)
+	pub intercepts_nxdomain: bool,
 }
 
 /// DNS query type
@@ -37,4 +39,24 @@ pub struct BenchmarkConfig {
 	pub inter_query_spacing: Duration,
 	pub query_aaaa: bool,
 	pub seed: Option<u64>,
+	/// Enable DNSSEC (DO bit) on all queries
+	pub dnssec: bool,
+	/// Enable TLD diversity measurement
+	pub query_tld: bool,
+	/// Enable discovery prefilter mode
+	pub discover: bool,
+	/// Number of top resolvers to keep in discovery mode
+	pub top_n: usize,
+	/// Maximum resolver latency in ms; resolvers above this are dropped from results
+	pub max_resolver_ms: f64,
+}
+
+/// Result of NXDOMAIN characterization for a single resolver
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct CharacterizationResult {
+	pub label: String,
+	pub addr: SocketAddr,
+	pub intercepts_nxdomain: bool,
+	pub reachable: bool,
 }

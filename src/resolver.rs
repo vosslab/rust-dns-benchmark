@@ -37,22 +37,52 @@ pub fn parse_resolver(input: &str) -> Result<ResolverConfig> {
 	};
 
 	let label = format!("{}", addr.ip());
-	Ok(ResolverConfig { label, addr })
+	Ok(ResolverConfig { label, addr, intercepts_nxdomain: false })
+}
+
+/// Parse a resolver line that may contain an inline comment label.
+///
+/// Format: "IP_ADDRESS  # Label"
+/// The label after '#' becomes the resolver's display name.
+fn parse_resolver_line(line: &str) -> Result<ResolverConfig> {
+	let trimmed = line.trim();
+
+	// Split on '#' to extract optional label
+	let (addr_part, label_part) = if let Some(idx) = trimmed.find('#') {
+		let addr = trimmed[..idx].trim();
+		let label = trimmed[idx + 1..].trim();
+		(addr, Some(label))
+	} else {
+		(trimmed, None)
+	};
+
+	let mut config = parse_resolver(addr_part)?;
+
+	// Use the inline comment as the label if present
+	if let Some(label) = label_part {
+		if !label.is_empty() {
+			config.label = label.to_string();
+		}
+	}
+
+	Ok(config)
 }
 
 /// Read resolver addresses from a file, one per line.
 ///
 /// Blank lines and lines starting with '#' are skipped.
+/// Inline comments after the address (e.g. "1.1.1.1 # Cloudflare") set the label.
 pub fn read_resolver_file(path: &str) -> Result<Vec<ResolverConfig>> {
 	let content = std::fs::read_to_string(path)
 		.map_err(|e| anyhow!("failed to read resolver file '{}': {}", path, e))?;
 	let mut resolvers = Vec::new();
 	for line in content.lines() {
 		let trimmed = line.trim();
+		// Skip blank lines and full-line comments
 		if trimmed.is_empty() || trimmed.starts_with('#') {
 			continue;
 		}
-		resolvers.push(parse_resolver(trimmed)?);
+		resolvers.push(parse_resolver_line(trimmed)?);
 	}
 	Ok(resolvers)
 }
@@ -83,23 +113,52 @@ pub fn system_resolvers() -> Vec<ResolverConfig> {
 }
 
 /// Return a list of well-known default resolvers.
+///
+/// Reads from the bundled resolvers.txt at the repo root. Falls back to
+/// a minimal hardcoded list if the file cannot be found.
 pub fn default_resolvers() -> Vec<ResolverConfig> {
+	// Try to find resolvers.txt relative to the executable or repo root
+	let candidates = vec![
+		std::path::PathBuf::from("resolvers.txt"),
+		std::env::current_exe()
+			.ok()
+			.and_then(|p| p.parent().map(|d| d.join("resolvers.txt")))
+			.unwrap_or_default(),
+	];
+
+	for path in &candidates {
+		if path.exists() {
+			if let Ok(resolvers) = read_resolver_file(
+				path.to_str().unwrap_or("resolvers.txt"),
+			) {
+				if !resolvers.is_empty() {
+					return resolvers;
+				}
+			}
+		}
+	}
+
+	// Hardcoded fallback if resolvers.txt is not found
 	vec![
 		ResolverConfig {
 			label: "Cloudflare".to_string(),
 			addr: "1.1.1.1:53".parse().unwrap(),
+			intercepts_nxdomain: false,
 		},
 		ResolverConfig {
 			label: "Google".to_string(),
 			addr: "8.8.8.8:53".parse().unwrap(),
+			intercepts_nxdomain: false,
 		},
 		ResolverConfig {
 			label: "Quad9".to_string(),
 			addr: "9.9.9.9:53".parse().unwrap(),
+			intercepts_nxdomain: false,
 		},
 		ResolverConfig {
 			label: "OpenDNS".to_string(),
 			addr: "208.67.222.222:53".parse().unwrap(),
+			intercepts_nxdomain: false,
 		},
 	]
 }
@@ -144,6 +203,22 @@ mod tests {
 	fn test_defaults_non_empty() {
 		let defaults = default_resolvers();
 		assert!(!defaults.is_empty());
-		assert_eq!(defaults.len(), 4);
+		// Should load from resolvers.txt (50+) or fallback to 4
+		assert!(defaults.len() >= 4);
+	}
+
+	#[test]
+	fn test_parse_resolver_line_with_label() {
+		let r = parse_resolver_line("1.1.1.1  # Cloudflare").unwrap();
+		assert_eq!(r.label, "Cloudflare");
+		assert_eq!(r.addr.ip().to_string(), "1.1.1.1");
+		assert_eq!(r.addr.port(), 53);
+	}
+
+	#[test]
+	fn test_parse_resolver_line_without_label() {
+		let r = parse_resolver_line("8.8.8.8").unwrap();
+		assert_eq!(r.label, "8.8.8.8");
+		assert_eq!(r.addr.ip().to_string(), "8.8.8.8");
 	}
 }
