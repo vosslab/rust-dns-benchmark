@@ -8,7 +8,6 @@ use crate::stats::SortMode;
 pub const DEFAULT_TIMEOUT_MS: u64 = 2000;
 pub const DEFAULT_CONCURRENCY: usize = 64;
 pub const DEFAULT_SPACING_MS: u64 = 25;
-pub const DEFAULT_TOP_N: usize = 50;
 pub const DEFAULT_MAX_RESOLVER_MS: f64 = 1000.0;
 pub const DEFAULT_SIDELINE_MS: f64 = 500.0;
 pub const DEFAULT_CHAR_TIMEOUT_MS: u64 = 50;
@@ -17,7 +16,16 @@ pub const DEFAULT_QUERY_AAAA: bool = true;
 pub const DEFAULT_DNSSEC: bool = true;
 pub const DEFAULT_INCLUDE_SYSTEM_RESOLVERS: bool = true;
 pub const DEFAULT_SORT: &str = "score";
+// Level-specific round defaults
+pub const DEFAULT_QUICK_ROUNDS: u32 = 3;
+pub const DEFAULT_MEDIUM_ROUNDS: u32 = 5;
+pub const DEFAULT_SLOW_ROUNDS: u32 = 7;
 pub const DEFAULT_EXHAUSTIVE_ROUNDS: u32 = 30;
+// Medium mode: max finalists promoted from qualification
+pub const DEFAULT_MEDIUM_FINALIST_COUNT: usize = 200;
+// Slow mode: purge ratio and minimum finalist floor
+pub const DEFAULT_SLOW_PURGE_RATIO: f64 = 0.5;
+pub const DEFAULT_SLOW_FINALIST_MIN: usize = 250;
 
 /// DNS transport protocol
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,10 +115,8 @@ pub struct BenchmarkConfig {
 	pub dnssec: bool,
 	/// Enable discovery prefilter mode
 	pub discover: bool,
-	/// Number of top resolvers to keep in discovery mode
-	pub top_n: usize,
-	/// Exhaustive mode: skip discovery Phase 2 (top-N cut)
-	pub exhaustive: bool,
+	/// Benchmark level
+	pub level: crate::cli::BenchLevel,
 	/// Maximum resolver latency in ms; resolvers above this are dropped from results
 	pub max_resolver_ms: f64,
 	/// Sort mode for ranking results

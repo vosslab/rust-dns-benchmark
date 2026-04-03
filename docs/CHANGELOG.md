@@ -3,17 +3,40 @@
 ## 2026-04-03
 
 ### Additions and New Features
+- Added live progress monitors with EMA-smoothed ETAs to all long-running phases: discovery screening, PTR lookups, characterization (reachability, NXDOMAIN, rebinding, DNSSEC), qualification, and benchmark rounds
+- Added phase timing summary printed before results table showing elapsed time and resolver counts per phase
+- Extracted reusable `spawn_progress_monitor()` and `stop_progress_monitor()` helpers in `src/bench.rs`
+- ETA display uses conservative 20% padding and rounds up to reduce jitter (5s buckets under 60s, 15s buckets under 10m, 30s buckets over 10m)
+
+### Behavior or Interface Changes
+- Discovery line now shows the screening timeout: `Discovery: reachability screen (500 ms timeout)` to clarify that screening uses a shorter timeout than the configured benchmark timeout
+- Extracted `SCREEN_TIMEOUT_MS` constant in `src/bench.rs` (was hardcoded 500ms)
+- Removed all per-resolver characterization output (VALIDATES, INTERCEPTS NXDOMAIN, reachable, etc.) regardless of resolver count; now shows only summary counts per phase
+- Removed per-resolver PTR lookup output; now shows only resolved/unresolved counts
+- Deleted `verbose_char` variable and all conditional per-resolver `println!` blocks from `run_characterization()`
+
+### Previous additions
 - Added `query_domains.csv` with data-driven domain categories (cached, uncached, tld, dotcom, dnssec) replacing hardcoded per-category functions
-- Added `--no-test` flag to print config summary and exit without running benchmark (useful with `--exhaustive` to verify resolver loading)
+- Added `--no-test` flag to print config summary and exit without running benchmark (useful with `--level` to verify resolver loading)
 - Added resolver deduplication by IP address after all sources are loaded, fixing count mismatch between CSV download and displayed total
 
 ### Behavior or Interface Changes
-- Exhaustive mode now skips discovery Phase 2 (top-N cut), keeping all reachable resolvers for the full benchmark instead of hard-cutting to top 50
+- Replaced `--exhaustive` with `--level quick|medium|slow|exhaustive` for four distinct benchmark modes:
+  - quick (default): built-in resolvers, 3 rounds — curated, fast
+  - medium: global CSV discovery + qualification pass + 5 rounds on finalists — broad but cheap
+  - slow: global CSV discovery + staged elimination tournament with progressive purging — ~7 rounds
+  - exhaustive: global CSV discovery + 30 full rounds on all survivors — no cuts
+- `--rounds` is now optional and overrides the level default when provided
+- Removed discovery Phase 2 (arbitrary top-N cut) entirely; discovery now only does reachability screening
+- Added qualification pass for medium mode: lightweight scoring (~10 queries/resolver) promotes most promising candidates
+- Added staged elimination for slow mode: 2-round blocks with progressive purging of the weaker half
+- Suppressed per-resolver characterization output for large resolver lists (>100), showing summary counts instead
+- Added round timing output showing elapsed time per round
 - Applied CLI argument minimalism round 2: reduced from 14 flags to 7. Removed `--scan`, `--aaaa`, `--dnssec`, `--seed`, `--no-system-resolvers`, `--sort`, `--query-domains`. Moved removed settings to compile-time constants in `src/transport.rs`
 - AAAA queries and DNSSEC are now always enabled (hardcoded on)
 - System resolvers from /etc/resolv.conf are now always included
 - Sort order hardcoded to "score"
-- `--scan` mode removed; `--exhaustive` subsumes it
+- `--scan` mode removed; `--level slow|exhaustive` subsumes it
 - Restructured config display into three clear sections: "Resolvers under test", "Query domains", and "Timing and options"
 - Renamed domain categories from warm/cold to cached/uncached for clarity
 - Results table columns are now dynamic based on loaded categories instead of hardcoded warm/cold/tld/dotcom/dnssec

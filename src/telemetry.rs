@@ -120,11 +120,11 @@ impl TelemetryLog {
 
 	//============================================
 	/// Log benchmark configuration at startup.
-	pub fn log_config(&self, rounds: u32, top_n: usize, spacing_ms: u64, mode: &str, resolver_count: usize) {
+	pub fn log_config(&self, rounds: u32, spacing_ms: u64, level: &str, resolver_count: usize) {
 		let ts = timestamp_iso();
 		let line = format!(
-			r#"{{"event":"config","timestamp":"{}","rounds":{},"top_n":{},"spacing_ms":{},"mode":"{}","resolver_count":{}}}"#,
-			ts, rounds, top_n, spacing_ms, json_escape(mode), resolver_count
+			r#"{{"event":"config","timestamp":"{}","rounds":{},"spacing_ms":{},"level":"{}","resolver_count":{}}}"#,
+			ts, rounds, spacing_ms, json_escape(level), resolver_count
 		);
 		self.write_line(&line);
 	}

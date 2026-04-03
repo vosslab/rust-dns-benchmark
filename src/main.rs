@@ -13,11 +13,12 @@ use clap::Parser;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use crate::cli::Cli;
+use crate::cli::{BenchLevel, Cli};
 use crate::transport::{BenchmarkConfig, DEFAULT_TIMEOUT_MS, DEFAULT_CONCURRENCY,
-	DEFAULT_SPACING_MS, DEFAULT_TOP_N, DEFAULT_MAX_RESOLVER_MS,
+	DEFAULT_SPACING_MS, DEFAULT_MAX_RESOLVER_MS,
 	DEFAULT_QUERY_AAAA, DEFAULT_DNSSEC, DEFAULT_INCLUDE_SYSTEM_RESOLVERS,
-	DEFAULT_SORT, DEFAULT_EXHAUSTIVE_ROUNDS};
+	DEFAULT_SORT, DEFAULT_QUICK_ROUNDS, DEFAULT_MEDIUM_ROUNDS,
+	DEFAULT_SLOW_ROUNDS, DEFAULT_EXHAUSTIVE_ROUNDS};
 
 /// GRC-compatible exit codes for automation and scripting.
 ///
@@ -61,6 +62,7 @@ async fn main() -> ExitCode {
 
 async fn run() -> anyhow::Result<()> {
 	let cli = Cli::parse();
+	let level = cli.level;
 
 	// Collect resolvers from all sources
 	let mut resolvers = Vec::new();
@@ -76,11 +78,12 @@ async fn run() -> anyhow::Result<()> {
 		resolvers.extend(resolver::read_resolver_file(path)?);
 	}
 
-	// Exhaustive mode: download CSV with metadata, fall back to local scan_global.txt
-	if cli.exhaustive {
+	// Global CSV download for medium, slow, and exhaustive levels
+	let needs_global = matches!(level, BenchLevel::Medium | BenchLevel::Slow | BenchLevel::Exhaustive);
+	if needs_global {
 		match resolver::download_exhaustive_csv().await {
 			Ok(csv_resolvers) if !csv_resolvers.is_empty() => {
-				println!("Exhaustive mode: loaded {} resolvers from public-dns.info CSV", csv_resolvers.len());
+				println!("{} mode: loaded {} resolvers from public-dns.info CSV", level, csv_resolvers.len());
 				resolvers.extend(csv_resolvers);
 			}
 			Ok(_) | Err(_) => {
@@ -93,9 +96,9 @@ async fn run() -> anyhow::Result<()> {
 					global_list = resolver::read_resolver_file(&global_path)?;
 				}
 				if global_list.is_empty() {
-					anyhow::bail!("Global scan list is empty after download. Cannot run --exhaustive mode.");
+					anyhow::bail!("Global scan list is empty after download. Cannot run {} mode.", level);
 				}
-				println!("Exhaustive mode: loading {} global public resolvers from fallback", global_list.len());
+				println!("{} mode: loading {} global public resolvers from fallback", level, global_list.len());
 				resolvers.extend(global_list);
 			}
 		}
@@ -140,10 +143,18 @@ async fn run() -> anyhow::Result<()> {
 	// Sort mode (compile-time default)
 	let sort_mode = stats::parse_sort_mode(DEFAULT_SORT);
 
+	// Determine rounds: user override via --rounds, or level default
+	let default_rounds = match level {
+		BenchLevel::Quick => DEFAULT_QUICK_ROUNDS,
+		BenchLevel::Medium => DEFAULT_MEDIUM_ROUNDS,
+		BenchLevel::Slow => DEFAULT_SLOW_ROUNDS,
+		BenchLevel::Exhaustive => DEFAULT_EXHAUSTIVE_ROUNDS,
+	};
+	let rounds = cli.rounds.unwrap_or(default_rounds);
+
 	// Auto-enable discovery when resolver list is large (>20)
-	let discover = cli.exhaustive || resolvers.len() > 20;
-	// Exhaustive mode overrides rounds for thorough testing
-	let rounds = if cli.exhaustive { DEFAULT_EXHAUSTIVE_ROUNDS } else { cli.rounds };
+	let discover = needs_global || resolvers.len() > 20;
+
 	let config = BenchmarkConfig {
 		rounds,
 		timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
@@ -153,16 +164,14 @@ async fn run() -> anyhow::Result<()> {
 		seed: None,
 		dnssec: DEFAULT_DNSSEC,
 		discover,
-		top_n: DEFAULT_TOP_N,
-		exhaustive: cli.exhaustive,
+		level,
 		max_resolver_ms: DEFAULT_MAX_RESOLVER_MS,
 		sort_mode,
 		telemetry: telemetry::TelemetryLog::new(true),
 	};
 
-	// Determine run mode for telemetry
-	let mode = if cli.exhaustive { "exhaustive" } else { "default" };
-	config.telemetry.log_config(rounds, DEFAULT_TOP_N, DEFAULT_SPACING_MS, mode, resolvers.len());
+	// Log config to telemetry
+	config.telemetry.log_config(rounds, DEFAULT_SPACING_MS, &level.to_string(), resolvers.len());
 
 	// Track resolver counts through the pipeline
 	let initial_count = resolvers.len();
@@ -180,12 +189,18 @@ async fn run() -> anyhow::Result<()> {
 	// Build DoH client pool for any DoH resolvers
 	let doh_clients = bench::build_doh_client_pool(&resolvers);
 
-	// Discovery mode: prefilter large resolver lists BEFORE characterization
-	// This avoids wasting time characterizing resolvers that will be dropped
+	// Track phase timings for summary
+	let mut phase_timings: Vec<(&str, std::time::Duration, Option<(usize, usize)>)> = Vec::new();
+	let pipeline_start = std::time::Instant::now();
+
+	// Discovery: reachability screen for large resolver lists
 	if config.discover {
+		let phase_start = std::time::Instant::now();
+		let before = resolvers.len();
 		resolvers = bench::run_discovery(
 			&resolvers, &categories, &config, &doh_clients,
 		).await?;
+		phase_timings.push(("Discovery", phase_start.elapsed(), Some((before, resolvers.len()))));
 		println!();
 	}
 
@@ -193,17 +208,39 @@ async fn run() -> anyhow::Result<()> {
 	config.telemetry.log_pipeline("after_discovery", post_discovery_count);
 
 	// Run reverse DNS (PTR) lookups and NXDOMAIN interception characterization
+	let char_phase_start = std::time::Instant::now();
+	let char_before = resolvers.len();
 	rdns::resolve_ptr_names(&mut resolvers, config.timeout).await;
 	bench::run_characterization(&mut resolvers, &config, &nxdomain_domains).await;
+	phase_timings.push(("Characterization", char_phase_start.elapsed(), Some((char_before, resolvers.len()))));
 
 	let post_char_count = resolvers.len();
 	config.telemetry.log_pipeline("after_characterization", post_char_count);
 
-	// Run benchmark
+	// Medium mode: run qualification pass and promote finalists
+	if level == BenchLevel::Medium {
+		let qual_start = std::time::Instant::now();
+		let qual_before = resolvers.len();
+		resolvers = bench::run_qualification(
+			&resolvers, &categories, &config, &doh_clients,
+		).await?;
+		phase_timings.push(("Qualification", qual_start.elapsed(), Some((qual_before, resolvers.len()))));
+		config.telemetry.log_pipeline("after_qualification", resolvers.len());
+	}
+
+	// Run benchmark (slow mode uses staged elimination internally)
 	println!("Running benchmark...");
-	let mut results = bench::run_benchmark(
-		&resolvers, &categories, &config, &doh_clients,
-	).await?;
+	let bench_start = std::time::Instant::now();
+	let mut results = if level == BenchLevel::Slow {
+		bench::run_staged_benchmark(
+			&resolvers, &categories, &config, &doh_clients,
+		).await?
+	} else {
+		bench::run_benchmark(
+			&resolvers, &categories, &config, &doh_clients,
+		).await?
+	};
+	phase_timings.push(("Benchmark", bench_start.elapsed(), None));
 
 	// Filter out resolvers with <50% success rate (too noisy to report)
 	let before_count = results.len();
@@ -263,8 +300,12 @@ async fn run() -> anyhow::Result<()> {
 	let final_count = results.len();
 	config.telemetry.log_pipeline("final_results", final_count);
 	output::print_pipeline_summary(
-		initial_count, post_discovery_count, post_char_count, final_count, DEFAULT_TOP_N,
+		initial_count, post_discovery_count, post_char_count, final_count,
 	);
+
+	// Print phase timing summary
+	let total_elapsed = pipeline_start.elapsed();
+	output::print_phase_timing(&phase_timings, total_elapsed);
 
 	// Print results table and conclusions
 	output::print_results_table(&results);

@@ -77,32 +77,29 @@ pub fn print_config_summary(
 	// Section 3: Timing and options
 	println!();
 	println!("Timing and options:");
-	println!("  Rounds:       {}", config.rounds);
-	println!("  Timeout:      {} ms", config.timeout.as_millis());
-	println!("  Char timeout: {} ms", crate::transport::DEFAULT_CHAR_TIMEOUT_MS);
-	println!("  Char attempts:{}", crate::transport::DEFAULT_CHAR_ATTEMPTS);
-	println!("  Concurrency:  {}", config.max_inflight);
-	println!("  Spacing:      {} ms", config.inter_query_spacing.as_millis());
+	println!("  Rounds:           {}", config.rounds);
+	println!("  Bench timeout:    {} ms", config.timeout.as_millis());
+	println!("  Char timeout:     {} ms", crate::transport::DEFAULT_CHAR_TIMEOUT_MS);
+	println!("  Char attempts:    {}", crate::transport::DEFAULT_CHAR_ATTEMPTS);
+	println!("  Concurrency:      {}", config.max_inflight);
+	println!("  Spacing:          {} ms", config.inter_query_spacing.as_millis());
 	let aaaa_label = if config.query_aaaa { "yes" } else { "no" };
-	println!("  Query AAAA:   {}", aaaa_label);
+	println!("  Query AAAA:       {}", aaaa_label);
 	let dnssec_label = if config.dnssec { "yes" } else { "no" };
-	println!("  DNSSEC (DO):  {}", dnssec_label);
+	println!("  DNSSEC (DO):      {}", dnssec_label);
+	println!("  Level:            {}", config.level);
 	if config.discover {
-		if config.exhaustive {
-			println!("  Discovery:    reachability only");
-		} else {
-			println!("  Discovery:    top {}", config.top_n);
-		}
+		println!("  Discovery:        reachability screen ({} ms timeout)", crate::bench::SCREEN_TIMEOUT_MS);
 	}
 	let sort_label = match &config.sort_mode {
 		crate::stats::SortMode::Score => "overall score".to_string(),
 		crate::stats::SortMode::Category(name) => format!("{} p50", name),
 		crate::stats::SortMode::Name => "name".to_string(),
 	};
-	println!("  Sort by:      {}", sort_label);
-	println!("  Pin system:   yes");
+	println!("  Sort by:          {}", sort_label);
+	println!("  Pin system:       yes");
 	if let Some(seed) = config.seed {
-		println!("  Seed:         {}", seed);
+		println!("  Seed:             {}", seed);
 	}
 	println!();
 }
@@ -255,18 +252,47 @@ pub fn print_pipeline_summary(
 	post_discovery: usize,
 	post_char: usize,
 	final_count: usize,
-	top_n: usize,
 ) {
 	println!("\nResolver Pipeline");
 	println!("-----------------");
 	println!("  Started:              {}", initial);
 	if post_discovery != initial {
-		println!("  After discovery:      {} (--top {} filter applied)", post_discovery, top_n);
+		println!("  After discovery:      {}", post_discovery);
 	}
 	if post_char != post_discovery {
 		println!("  After characterization: {}", post_char);
 	}
 	println!("  Final results:        {}", final_count);
+}
+
+/// Print a compact phase-by-phase timing breakdown.
+pub fn print_phase_timing(
+	phases: &[(&str, std::time::Duration, Option<(usize, usize)>)],
+	total: std::time::Duration,
+) {
+	println!("\nPhase Timing");
+	println!("------------");
+	for (name, dur, counts) in phases {
+		let secs = dur.as_secs();
+		let time_str = if secs >= 60 {
+			format!("{}m {}s", secs / 60, secs % 60)
+		} else {
+			format!("{}s", secs)
+		};
+		// Right-pad phase name and left-pad time for alignment
+		let count_str = match counts {
+			Some((before, after)) => format!("  ({} -> {} resolvers)", before, after),
+			None => String::new(),
+		};
+		println!("  {:<20} {:>8}{}", name, time_str, count_str);
+	}
+	let total_secs = total.as_secs();
+	let total_str = if total_secs >= 60 {
+		format!("{}m {}s", total_secs / 60, total_secs % 60)
+	} else {
+		format!("{}s", total_secs)
+	};
+	println!("  {:<20} {:>8}", "Total", total_str);
 }
 
 /// Print heuristic conclusions about the benchmark results.

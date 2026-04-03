@@ -18,6 +18,9 @@ use tokio_rustls::TlsConnector;
 use crate::transport::{
 	DnsTransport, ResolverConfig, QueryType, QueryResult, BenchmarkConfig,
 };
+
+/// Timeout for Phase 1 discovery reachability screen (ms)
+pub const SCREEN_TIMEOUT_MS: u64 = 500;
 use crate::dns::{
 	build_query, parse_response, check_nxdomain_interception,
 	check_rebinding_protection, check_dnssec_validation,
@@ -27,8 +30,103 @@ use crate::stats::{
 	rank_resolvers, ResolverStats, ScoredResolver,
 };
 
+use tokio::task::JoinHandle;
+
 /// Shared pool of reqwest clients for DoH, keyed by resolver URL
 type DohClientPool = HashMap<String, reqwest::Client>;
+
+/// Format a duration in seconds to a human-readable string like "2m 15s" or "8s".
+fn format_duration_secs(secs: u64) -> String {
+	if secs >= 60 {
+		format!("{}m {}s", secs / 60, secs % 60)
+	} else {
+		format!("{}s", secs)
+	}
+}
+
+/// Round an ETA (in seconds) up to reduce display jitter.
+/// Under 60s: round up to nearest 5s.
+/// 1-10m: round up to nearest 15s.
+/// Over 10m: round up to nearest 30s.
+fn round_eta_up(secs: f64) -> u64 {
+	let s = secs.ceil() as u64;
+	if s == 0 {
+		return 0;
+	}
+	let bucket = if s < 60 {
+		5
+	} else if s < 600 {
+		15
+	} else {
+		30
+	};
+	// Round up to next multiple of bucket
+	((s + bucket - 1) / bucket) * bucket
+}
+
+/// Spawn a progress monitor that prints live progress with EMA-smoothed ETA.
+///
+/// Returns the JoinHandle so the caller can abort it when done.
+/// The monitor prints to stderr every 500ms with carriage-return overwrite.
+pub fn spawn_progress_monitor(
+	label: String,
+	completed: Arc<AtomicUsize>,
+	total: usize,
+	start: Instant,
+) -> JoinHandle<()> {
+	tokio::spawn(async move {
+		// EMA-smoothed rate for jitter reduction
+		let mut smoothed_rate: Option<f64> = None;
+		let alpha = 0.1;
+		loop {
+			tokio::time::sleep(Duration::from_millis(500)).await;
+			let done = completed.load(Ordering::Relaxed);
+			let pct = if total > 0 { done * 100 / total } else { 100 };
+			let elapsed = start.elapsed().as_secs_f64();
+			// Calculate ETA with EMA smoothing
+			let eta_str = if done == 0 || elapsed < 0.001 {
+				"--".to_string()
+			} else {
+				let current_rate = done as f64 / elapsed;
+				let rate = match smoothed_rate {
+					Some(prev) => {
+						let r = alpha * current_rate + (1.0 - alpha) * prev;
+						smoothed_rate = Some(r);
+						r
+					}
+					None => {
+						smoothed_rate = Some(current_rate);
+						current_rate
+					}
+				};
+				if rate > 0.0 {
+					let remaining = (total - done) as f64 / rate;
+					// Pad 20% conservative
+					let conservative = remaining * 1.2;
+					let rounded = round_eta_up(conservative);
+					format!("~{} remaining", format_duration_secs(rounded))
+				} else {
+					"--".to_string()
+				}
+			};
+			eprint!("\r  {}: {}/{} ({}%) -- {}",
+				label, done, total, pct, eta_str);
+		}
+	})
+}
+
+/// Stop a progress monitor and print the final summary line with elapsed time.
+pub fn stop_progress_monitor(
+	monitor: JoinHandle<()>,
+	label: &str,
+	total: usize,
+	start: Instant,
+) {
+	monitor.abort();
+	let elapsed_secs = start.elapsed().as_secs();
+	let time_str = format_duration_secs(elapsed_secs);
+	eprint!("\r  {}: {}/{} (100%) -- {}\n", label, total, total, time_str);
+}
 
 /// Send a single DNS query over UDP and measure latency.
 ///
@@ -398,25 +496,29 @@ pub async fn run_characterization(
 	let timeout = config.timeout;
 
 	// Phase 0: v2-style reachability pre-check
-	// Give each resolver up to DEFAULT_CHAR_ATTEMPTS chances to reply within DEFAULT_CHAR_TIMEOUT_MS
 	let char_timeout = Duration::from_millis(crate::transport::DEFAULT_CHAR_TIMEOUT_MS);
 	let char_attempts = crate::transport::DEFAULT_CHAR_ATTEMPTS;
 	println!("Reachability pre-check ({} resolvers, {} attempts, {} ms timeout)...",
 		resolvers.len(), char_attempts, char_timeout.as_millis());
 
 	let semaphore = std::sync::Arc::new(Semaphore::new(32));
-	let mut reachability_handles = Vec::new();
+	let phase0_total = resolvers.len();
+	let phase0_done = Arc::new(AtomicUsize::new(0));
+	let phase0_start = Instant::now();
+	let monitor = spawn_progress_monitor(
+		"Reachability".to_string(), phase0_done.clone(), phase0_total, phase0_start,
+	);
 
+	let mut reachability_handles = Vec::new();
 	for (i, resolver) in resolvers.iter().enumerate() {
 		let addr = resolver.addr;
-		let label = resolver.label.clone();
 		let sem = semaphore.clone();
 		let ct = char_timeout;
 		let attempts = char_attempts;
+		let done = phase0_done.clone();
 
 		reachability_handles.push(tokio::spawn(async move {
 			let _permit = sem.acquire().await.unwrap();
-			// Send up to `attempts` A queries for google.com, check if any reply in time
 			let mut any_fast = false;
 			for _ in 0..attempts {
 				let txid: u16 = rand::random();
@@ -432,24 +534,23 @@ pub async fn run_characterization(
 					break;
 				}
 			}
-			(i, label, addr, any_fast)
+			done.fetch_add(1, Ordering::Relaxed);
+			(i, any_fast)
 		}));
 	}
 
-	// Collect reachability results and sideline unreachable resolvers
 	let mut reachable = vec![false; resolvers.len()];
 	for handle in reachability_handles {
 		match handle.await {
-			Ok((idx, label, addr, is_reachable)) => {
+			Ok((idx, is_reachable)) => {
 				reachable[idx] = is_reachable;
-				let status = if is_reachable { "reachable" } else { "SIDELINED (unreachable)" };
-				println!("  {} ({}): {}", label, addr.ip(), status);
 			}
 			Err(e) => {
 				eprintln!("Warning: reachability check failed: {}", e);
 			}
 		}
 	}
+	stop_progress_monitor(monitor, "Reachability", phase0_total, phase0_start);
 
 	// Remove unreachable resolvers
 	let before = resolvers.len();
@@ -465,103 +566,138 @@ pub async fn run_characterization(
 
 	// Phase 1: NXDOMAIN interception check
 	println!("Checking NXDOMAIN interception ({} resolvers)...", resolvers.len());
+	let phase1_total = resolvers.len();
+	let phase1_done = Arc::new(AtomicUsize::new(0));
+	let phase1_start = Instant::now();
+	let monitor = spawn_progress_monitor(
+		"NXDOMAIN check".to_string(), phase1_done.clone(), phase1_total, phase1_start,
+	);
 
 	let mut handles = Vec::new();
-
 	for (i, resolver) in resolvers.iter().enumerate() {
 		let addr = resolver.addr;
-		let label = resolver.label.clone();
 		let sem = semaphore.clone();
 		let tm = timeout;
 		let domains = nxdomain_domains.to_vec();
+		let done = phase1_done.clone();
 
 		handles.push(tokio::spawn(async move {
 			let _permit = sem.acquire().await.unwrap();
 			let intercepts = check_nxdomain_interception(addr, tm, &domains).await;
-			(i, label, addr, intercepts)
+			done.fetch_add(1, Ordering::Relaxed);
+			(i, intercepts)
 		}));
 	}
 
+	let mut nxdomain_intercept_count = 0usize;
 	for handle in handles {
 		match handle.await {
-			Ok((idx, label, addr, intercepts)) => {
+			Ok((idx, intercepts)) => {
 				resolvers[idx].intercepts_nxdomain = intercepts;
-				let status = if intercepts { "INTERCEPTS NXDOMAIN" } else { "OK" };
-				println!("  {} ({}): {}", label, addr.ip(), status);
+				if intercepts { nxdomain_intercept_count += 1; }
 			}
 			Err(e) => {
 				eprintln!("Warning: characterization task failed: {}", e);
 			}
 		}
 	}
+	stop_progress_monitor(monitor, "NXDOMAIN check", phase1_total, phase1_start);
+	println!("  {} intercept NXDOMAIN, {} OK",
+		nxdomain_intercept_count, resolvers.len() - nxdomain_intercept_count);
 	println!();
 
-	// Check rebinding protection
+	// Phase 2: Check rebinding protection
 	println!("Checking DNS rebinding protection ({} resolvers)...", resolvers.len());
+	let phase2_total = resolvers.len();
+	let phase2_done = Arc::new(AtomicUsize::new(0));
+	let phase2_start = Instant::now();
+	let monitor = spawn_progress_monitor(
+		"Rebinding check".to_string(), phase2_done.clone(), phase2_total, phase2_start,
+	);
+
 	let mut rebind_handles = Vec::new();
 	for (i, resolver) in resolvers.iter().enumerate() {
 		let addr = resolver.addr;
-		let label = resolver.label.clone();
 		let sem = semaphore.clone();
 		let tm = timeout;
+		let done = phase2_done.clone();
 
 		rebind_handles.push(tokio::spawn(async move {
 			let _permit = sem.acquire().await.unwrap();
 			let protection = check_rebinding_protection(addr, tm).await;
-			(i, label, addr, protection)
+			done.fetch_add(1, Ordering::Relaxed);
+			(i, protection)
 		}));
 	}
 
+	let mut rebind_protected = 0usize;
+	let mut rebind_not = 0usize;
+	let mut rebind_unknown = 0usize;
 	for handle in rebind_handles {
 		match handle.await {
-			Ok((idx, label, addr, protection)) => {
+			Ok((idx, protection)) => {
 				resolvers[idx].rebinding_protection = protection;
-				let status = match protection {
-					Some(true) => "PROTECTED",
-					Some(false) => "not protected",
-					None => "unknown",
-				};
-				println!("  {} ({}): {}", label, addr.ip(), status);
+				match protection {
+					Some(true) => rebind_protected += 1,
+					Some(false) => rebind_not += 1,
+					None => rebind_unknown += 1,
+				}
 			}
 			Err(e) => {
 				eprintln!("Warning: rebinding check failed: {}", e);
 			}
 		}
 	}
+	stop_progress_monitor(monitor, "Rebinding check", phase2_total, phase2_start);
+	println!("  {} protected, {} not protected, {} unknown",
+		rebind_protected, rebind_not, rebind_unknown);
 	println!();
 
-	// Check DNSSEC validation
+	// Phase 3: Check DNSSEC validation
 	println!("Checking DNSSEC validation ({} resolvers)...", resolvers.len());
+	let phase3_total = resolvers.len();
+	let phase3_done = Arc::new(AtomicUsize::new(0));
+	let phase3_start = Instant::now();
+	let monitor = spawn_progress_monitor(
+		"DNSSEC check".to_string(), phase3_done.clone(), phase3_total, phase3_start,
+	);
+
 	let mut dnssec_handles = Vec::new();
 	for (i, resolver) in resolvers.iter().enumerate() {
 		let addr = resolver.addr;
-		let label = resolver.label.clone();
 		let sem = semaphore.clone();
 		let tm = timeout;
+		let done = phase3_done.clone();
 
 		dnssec_handles.push(tokio::spawn(async move {
 			let _permit = sem.acquire().await.unwrap();
 			let validates = check_dnssec_validation(addr, tm).await;
-			(i, label, addr, validates)
+			done.fetch_add(1, Ordering::Relaxed);
+			(i, validates)
 		}));
 	}
 
+	let mut dnssec_validates = 0usize;
+	let mut dnssec_not = 0usize;
+	let mut dnssec_unknown = 0usize;
 	for handle in dnssec_handles {
 		match handle.await {
-			Ok((idx, label, addr, validates)) => {
+			Ok((idx, validates)) => {
 				resolvers[idx].validates_dnssec = validates;
-				let status = match validates {
-					Some(true) => "VALIDATES",
-					Some(false) => "does not validate",
-					None => "unknown",
-				};
-				println!("  {} ({}): {}", label, addr.ip(), status);
+				match validates {
+					Some(true) => dnssec_validates += 1,
+					Some(false) => dnssec_not += 1,
+					None => dnssec_unknown += 1,
+				}
 			}
 			Err(e) => {
 				eprintln!("Warning: DNSSEC validation check failed: {}", e);
 			}
 		}
 	}
+	stop_progress_monitor(monitor, "DNSSEC check", phase3_total, phase3_start);
+	println!("  {} validate, {} do not validate, {} unknown",
+		dnssec_validates, dnssec_not, dnssec_unknown);
 
 	println!();
 }
@@ -576,7 +712,6 @@ pub async fn run_discovery(
 	config: &BenchmarkConfig,
 	doh_clients: &DohClientPool,
 ) -> Result<Vec<ResolverConfig>> {
-	let top_n = config.top_n;
 	println!("Discovery mode: screening {} resolvers...", resolvers.len());
 
 	// Pick discovery domains from the first category with enough entries
@@ -587,11 +722,18 @@ pub async fn run_discovery(
 		.unwrap_or(&[]);
 
 	// Phase 1: fast parallel reachability screen (1 query, 500ms timeout)
-	let screen_timeout = Duration::from_millis(500);
+	let screen_timeout = Duration::from_millis(SCREEN_TIMEOUT_MS);
 	let screen_domain = discovery_domains.first()
 		.map(|s| s.as_str())
 		.unwrap_or("google.com");
 	let semaphore = std::sync::Arc::new(Semaphore::new(config.max_inflight));
+
+	let screen_total = resolvers.len();
+	let screen_done = Arc::new(AtomicUsize::new(0));
+	let screen_start = Instant::now();
+	let monitor = spawn_progress_monitor(
+		"Screening".to_string(), screen_done.clone(), screen_total, screen_start,
+	);
 
 	let mut screen_handles = Vec::new();
 	for resolver in resolvers {
@@ -600,6 +742,7 @@ pub async fn run_discovery(
 		let domain = screen_domain.to_string();
 		let resolver_clone = resolver.clone();
 		let doh_clients = doh_clients.clone();
+		let done = screen_done.clone();
 
 		screen_handles.push(tokio::spawn(async move {
 			let _permit = sem.acquire().await.unwrap();
@@ -608,12 +751,16 @@ pub async fn run_discovery(
 				&domain, QueryType::A, txid, dnssec,
 			) {
 				Ok(b) => b,
-				Err(_) => return (resolver_clone, false),
+				Err(_) => {
+					done.fetch_add(1, Ordering::Relaxed);
+					return (resolver_clone, false);
+				}
 			};
 			let result = dispatch_query(
 				&resolver_clone, &query_bytes, screen_timeout,
 				txid, &domain, QueryType::A, &doh_clients,
 			).await;
+			done.fetch_add(1, Ordering::Relaxed);
 			(resolver_clone, result.success)
 		}));
 	}
@@ -626,6 +773,7 @@ pub async fn run_discovery(
 			}
 		}
 	}
+	stop_progress_monitor(monitor, "Screening", screen_total, screen_start);
 
 	let unreachable = resolvers.len() - survivors.len();
 	println!(
@@ -633,90 +781,226 @@ pub async fn run_discovery(
 		survivors.len(), resolvers.len(), unreachable,
 	);
 
-	if config.exhaustive {
-		println!("  Exhaustive mode: keeping all {} reachable resolvers (no top-N cut)", survivors.len());
-		config.telemetry.log_pipeline("discovery_reachable", survivors.len());
-		config.telemetry.log_pipeline("discovery_top_n", survivors.len());
-		return Ok(survivors);
+	config.telemetry.log_pipeline("discovery_reachable", survivors.len());
+	Ok(survivors)
+}
+
+/// Run a lightweight qualification pass to select finalists for medium mode.
+///
+/// Sends a small number of queries per resolver (cached + uncached + NXDOMAIN)
+/// and scores by median latency, variance, timeout rate, and correctness.
+/// Returns the most promising candidates up to the finalist budget.
+pub async fn run_qualification(
+	resolvers: &[ResolverConfig],
+	categories: &std::collections::BTreeMap<String, Vec<String>>,
+	config: &BenchmarkConfig,
+	doh_clients: &DohClientPool,
+) -> Result<Vec<ResolverConfig>> {
+	let finalist_count = crate::transport::DEFAULT_MEDIUM_FINALIST_COUNT;
+	println!("Qualification pass: scoring {} resolvers...", resolvers.len());
+
+	// Build a small domain set: up to 3 cached, 5 uncached, 2 from other categories
+	let mut qual_domains: Vec<String> = Vec::new();
+	if let Some(cached) = categories.get("cached") {
+		qual_domains.extend(cached.iter().take(3).cloned());
+	}
+	if let Some(uncached) = categories.get("uncached") {
+		qual_domains.extend(uncached.iter().take(5).cloned());
+	}
+	// Add 2 from any other category for diversity
+	for (name, domains) in categories {
+		if name != "cached" && name != "uncached" && qual_domains.len() < 12 {
+			qual_domains.extend(domains.iter().take(2).cloned());
+		}
+	}
+	if qual_domains.is_empty() {
+		// Fallback if no categories available
+		qual_domains.push("google.com".to_string());
 	}
 
-	if survivors.len() <= top_n {
-		println!("  Keeping all {} survivors (at or below --top {})", survivors.len(), top_n);
-		config.telemetry.log_pipeline("discovery_reachable", survivors.len());
-		config.telemetry.log_pipeline("discovery_top_n", survivors.len());
-		return Ok(survivors);
-	}
+	println!("  Using {} qualification domains", qual_domains.len());
 
-	// Phase 2: parallel warm-only benchmark on survivors
-	println!("  Quick benchmark on {} survivors...", survivors.len());
-	let timeout_penalty_ms = config.timeout.as_millis() as f64;
-	let mut resolver_latencies: HashMap<String, Vec<f64>> = HashMap::new();
+	let semaphore = std::sync::Arc::new(Semaphore::new(config.max_inflight));
+	let timeout = config.timeout;
 
-	// Build all tasks and run concurrently
-	let mut bench_handles = Vec::new();
-	for resolver in &survivors {
-		for domain in discovery_domains {
+	// Total tasks = resolvers * domains
+	let qual_total = resolvers.len() * qual_domains.len();
+	let qual_done = Arc::new(AtomicUsize::new(0));
+	let qual_start = Instant::now();
+	let monitor = spawn_progress_monitor(
+		"Qualifying".to_string(), qual_done.clone(), qual_total, qual_start,
+	);
+
+	// Run qualification queries
+	let mut handles = Vec::new();
+	for resolver in resolvers {
+		for domain in &qual_domains {
 			let sem = semaphore.clone();
 			let resolver_clone = resolver.clone();
-			let timeout = config.timeout;
 			let dnssec = config.dnssec;
 			let domain_clone = domain.clone();
 			let doh_clients = doh_clients.clone();
+			let done = qual_done.clone();
 
-			bench_handles.push(tokio::spawn(async move {
+			handles.push(tokio::spawn(async move {
 				let _permit = sem.acquire().await.unwrap();
 				let txid: u16 = rand::random();
 				let query_bytes = match build_query(
 					&domain_clone, QueryType::A, txid, dnssec,
 				) {
 					Ok(b) => b,
-					Err(_) => return (resolver_clone.addr.ip().to_string(), None),
+					Err(_) => {
+						done.fetch_add(1, Ordering::Relaxed);
+						return (resolver_clone.addr.ip().to_string(), None, true);
+					}
 				};
 				let result = dispatch_query(
 					&resolver_clone, &query_bytes, timeout,
 					txid, &domain_clone, QueryType::A, &doh_clients,
 				).await;
+				done.fetch_add(1, Ordering::Relaxed);
 				if result.success {
 					let latency_ms = result.latency.as_secs_f64() * 1000.0;
-					(resolver_clone.addr.ip().to_string(), Some(latency_ms))
+					(resolver_clone.addr.ip().to_string(), Some(latency_ms), false)
 				} else {
-					(resolver_clone.addr.ip().to_string(), None)
+					(resolver_clone.addr.ip().to_string(), None, result.timeout)
 				}
 			}));
 		}
 	}
 
-	for handle in bench_handles {
-		if let Ok((ip, Some(latency_ms))) = handle.await {
-			resolver_latencies
-				.entry(ip)
-				.or_default()
-				.push(latency_ms);
+	// Collect results per resolver
+	let mut resolver_data: HashMap<String, (Vec<f64>, usize, usize)> = HashMap::new();
+	for handle in handles {
+		if let Ok((ip, latency, is_timeout)) = handle.await {
+			let entry = resolver_data.entry(ip).or_insert_with(|| (Vec::new(), 0, 0));
+			entry.1 += 1; // total queries
+			if let Some(lat) = latency {
+				entry.0.push(lat);
+			}
+			if is_timeout {
+				entry.2 += 1; // timeout count
+			}
 		}
 	}
+	stop_progress_monitor(monitor, "Qualifying", qual_total, qual_start);
 
-	// Sort by warm p50 and keep top N
-	let mut scored: Vec<(String, f64)> = resolver_latencies.iter()
-		.map(|(ip, lats)| {
-			let stats = compute_set_stats(lats, lats.len(), 0, lats.len(), timeout_penalty_ms);
-			(ip.clone(), stats.p50_ms)
+	// Score each resolver: lower is better
+	// Score = median_latency + (variance_penalty) + (timeout_penalty)
+	let timeout_penalty_ms = config.timeout.as_millis() as f64;
+	let mut scored: Vec<(String, f64)> = resolver_data.iter()
+		.map(|(ip, (latencies, total, timeouts))| {
+			let timeout_rate = *timeouts as f64 / *total as f64;
+			if latencies.is_empty() {
+				// No successful queries — worst score
+				return (ip.clone(), f64::INFINITY);
+			}
+			let mut sorted = latencies.clone();
+			sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+			let median = sorted[sorted.len() / 2];
+			// Variance: standard deviation
+			let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
+			let variance = sorted.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / sorted.len() as f64;
+			let stddev = variance.sqrt();
+			// Combined score: median + stddev + timeout penalty
+			let score = median + stddev + (timeout_rate * timeout_penalty_ms);
+			(ip.clone(), score)
 		})
 		.collect();
+
+	// Sort by score (lower = better)
 	scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-	let top_ips: Vec<String> = scored.into_iter()
-		.take(top_n)
+	// Take finalists up to budget
+	let promote_count = scored.len().min(finalist_count);
+	let finalist_ips: std::collections::HashSet<String> = scored.into_iter()
+		.take(promote_count)
 		.map(|(ip, _)| ip)
 		.collect();
 
-	let filtered: Vec<ResolverConfig> = survivors.into_iter()
-		.filter(|r| top_ips.contains(&r.addr.ip().to_string()))
+	let finalists: Vec<ResolverConfig> = resolvers.iter()
+		.filter(|r| finalist_ips.contains(&r.addr.ip().to_string()))
+		.cloned()
 		.collect();
 
-	println!("  Kept top {} resolvers for full benchmark", filtered.len());
-	config.telemetry.log_pipeline("discovery_reachable", resolver_latencies.len());
-	config.telemetry.log_pipeline("discovery_top_n", filtered.len());
-	Ok(filtered)
+	println!("  Promoted {} finalists from {} candidates for full benchmark",
+		finalists.len(), resolvers.len());
+
+	Ok(finalists)
+}
+
+/// Run a staged elimination benchmark for slow mode.
+///
+/// Runs 2-round blocks with progressive purging of the weaker half
+/// until the finalist floor is reached, then runs remaining rounds
+/// on the final set.
+pub async fn run_staged_benchmark(
+	resolvers: &[ResolverConfig],
+	categories: &std::collections::BTreeMap<String, Vec<String>>,
+	config: &BenchmarkConfig,
+	doh_clients: &DohClientPool,
+) -> Result<Vec<ScoredResolver>> {
+	let purge_ratio = crate::transport::DEFAULT_SLOW_PURGE_RATIO;
+	let finalist_min = crate::transport::DEFAULT_SLOW_FINALIST_MIN;
+	let total_rounds = config.rounds;
+
+	println!("Staged elimination: {} resolvers, {} total rounds, purge {:.0}% per stage",
+		resolvers.len(), total_rounds, purge_ratio * 100.0);
+
+	let mut active_resolvers = resolvers.to_vec();
+	let mut round_offset = 0u32;
+
+	while round_offset < total_rounds {
+		// Run 2-round block (or remaining rounds if fewer left)
+		let block_rounds = 2.min(total_rounds - round_offset);
+
+		// Build a config for this block
+		let mut block_config = config.clone();
+		block_config.rounds = block_rounds;
+
+		println!("  Stage: {} resolvers, rounds {}-{}",
+			active_resolvers.len(),
+			round_offset + 1,
+			round_offset + block_rounds);
+
+		let results = run_benchmark(
+			&active_resolvers, categories, &block_config, doh_clients,
+		).await?;
+
+		round_offset += block_rounds;
+
+		// Check if we should purge
+		let target_count = (active_resolvers.len() as f64 * (1.0 - purge_ratio)) as usize;
+		if round_offset < total_rounds && active_resolvers.len() > finalist_min && target_count >= finalist_min {
+			// Keep the top half by score
+			let keep_count = target_count.max(finalist_min);
+			let keep_ips: std::collections::HashSet<String> = results.iter()
+				.take(keep_count)
+				.map(|r| r.stats.addr.clone())
+				.collect();
+
+			let before = active_resolvers.len();
+			active_resolvers.retain(|r| keep_ips.contains(&r.addr.ip().to_string()));
+			println!("  Purged: {} -> {} resolvers (removed weaker half)",
+				before, active_resolvers.len());
+		} else if round_offset >= total_rounds {
+			// Final block — return these results
+			return Ok(results);
+		}
+	}
+
+	// Final benchmark on remaining resolvers
+	let mut final_config = config.clone();
+	final_config.rounds = 2.min(total_rounds.saturating_sub(round_offset));
+	if final_config.rounds > 0 {
+		let results = run_benchmark(
+			&active_resolvers, categories, &final_config, doh_clients,
+		).await?;
+		return Ok(results);
+	}
+
+	// Shouldn't reach here, but run a final pass just in case
+	run_benchmark(&active_resolvers, categories, config, doh_clients).await
 }
 
 /// Run the full benchmark across all resolvers and domains.
@@ -776,6 +1060,7 @@ pub async fn run_benchmark(
 		.collect();
 
 	for round in 0..config.rounds {
+		let round_start = std::time::Instant::now();
 		// Filter out sidelined resolvers for this round
 		let mut round_tasks = tasks.clone();
 		if !sidelined.is_empty() {
@@ -786,19 +1071,11 @@ pub async fn run_benchmark(
 		let round_total = round_tasks.len();
 		let completed_count = Arc::new(AtomicUsize::new(0));
 
-		// Progress monitor: print status every 500ms
-		let progress_counter = completed_count.clone();
-		let round_num = round + 1;
-		let total_rounds = config.rounds;
-		let monitor = tokio::spawn(async move {
-			loop {
-				tokio::time::sleep(Duration::from_millis(500)).await;
-				let done = progress_counter.load(Ordering::Relaxed);
-				let pct = if round_total > 0 { done * 100 / round_total } else { 100 };
-				eprint!("\r  Round {}/{}: {}/{} queries ({}%)",
-					round_num, total_rounds, done, round_total, pct);
-			}
-		});
+		// Progress monitor with ETA
+		let round_label = format!("Round {}/{}", round + 1, config.rounds);
+		let monitor = spawn_progress_monitor(
+			round_label.clone(), completed_count.clone(), round_total, round_start,
+		);
 
 		// Spawn all query tasks for this round
 		let mut handles = Vec::new();
@@ -867,10 +1144,8 @@ pub async fn run_benchmark(
 			}
 		}
 
-		// Stop progress monitor and print final line for this round
-		monitor.abort();
-		eprint!("\r  Round {}/{}: {}/{} queries (100%)    \n",
-			round + 1, config.rounds, round_total, round_total);
+		// Stop progress monitor and print final line with elapsed time
+		stop_progress_monitor(monitor, &round_label, round_total, round_start);
 
 		// Log round completion to telemetry
 		let round_failures = all_results.iter()
