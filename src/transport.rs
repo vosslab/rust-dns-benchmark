@@ -108,4 +108,6 @@ pub struct BenchmarkConfig {
 	pub char_attempts: u32,
 	/// Enable DNSSEC-signed domain benchmarking (only when dnssec is true)
 	pub query_dnssec_domains: bool,
+	/// Telemetry logger for JSONL debug output
+	pub telemetry: crate::telemetry::TelemetryLog,
 }

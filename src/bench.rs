@@ -628,6 +628,8 @@ pub async fn run_discovery(
 
 	if survivors.len() <= top_n {
 		println!("  Keeping all {} survivors (at or below --top {})", survivors.len(), top_n);
+		config.telemetry.log_pipeline("discovery_reachable", survivors.len());
+		config.telemetry.log_pipeline("discovery_top_n", survivors.len());
 		return Ok(survivors);
 	}
 
@@ -698,6 +700,8 @@ pub async fn run_discovery(
 		.collect();
 
 	println!("  Kept top {} resolvers for full benchmark", filtered.len());
+	config.telemetry.log_pipeline("discovery_reachable", resolver_latencies.len());
+	config.telemetry.log_pipeline("discovery_top_n", filtered.len());
 	Ok(filtered)
 }
 
@@ -847,9 +851,10 @@ pub async fn run_benchmark(
 				// Acquire semaphore permit for concurrency control
 				let _permit = sem.acquire().await.unwrap();
 
-				// Inter-query spacing delay
+				// Inter-query spacing delay with random jitter (0-50% of spacing)
 				if !spacing.is_zero() {
-					tokio::time::sleep(spacing).await;
+					let jitter_ms = rand::random::<u64>() % (spacing.as_millis() as u64 / 2 + 1);
+					tokio::time::sleep(spacing + std::time::Duration::from_millis(jitter_ms)).await;
 				}
 
 				// Generate a random transaction ID
@@ -904,6 +909,15 @@ pub async fn run_benchmark(
 		eprint!("\r  Round {}/{}: {}/{} queries (100%)    \n",
 			round + 1, config.rounds, round_total, round_total);
 
+		// Log round completion to telemetry
+		let round_failures = all_results.iter()
+			.filter(|(t, r)| {
+				let ip = t.resolver.addr.ip().to_string();
+				!sidelined.contains(&ip) && !r.success
+			})
+			.count();
+		config.telemetry.log_round_complete(round + 1, round_total, round_failures);
+
 		// Mid-benchmark sidelining: check for slow/dead resolvers after each round
 		if config.sideline && round < config.rounds - 1 {
 			let mut per_resolver: HashMap<String, (usize, usize, Vec<f64>)> = HashMap::new();
@@ -925,8 +939,9 @@ pub async fn run_benchmark(
 				if timeout_rate > 0.8 {
 					let label = label_map_for_sideline.get(ip)
 						.cloned().unwrap_or_else(|| ip.clone());
-					println!("  Sidelined {} ({}) -- {:.0}% timeouts",
-						label, ip, timeout_rate * 100.0);
+					let reason = format!("{:.0}% timeouts", timeout_rate * 100.0);
+					println!("  Sidelined {} ({}) -- {}", label, ip, reason);
+					config.telemetry.log_sidelined(ip, &reason, round + 1);
 					sidelined.insert(ip.clone());
 					continue;
 				}
@@ -938,8 +953,9 @@ pub async fn run_benchmark(
 					if p50 > config.sideline_ms {
 						let label = label_map_for_sideline.get(ip)
 							.cloned().unwrap_or_else(|| ip.clone());
-						println!("  Sidelined {} ({}) -- p50 {:.0} ms > {} ms threshold",
-							label, ip, p50, config.sideline_ms as u64);
+						let reason = format!("p50 {:.0} ms > {} ms threshold", p50, config.sideline_ms as u64);
+						println!("  Sidelined {} ({}) -- {}", label, ip, reason);
+						config.telemetry.log_sidelined(ip, &reason, round + 1);
 						sidelined.insert(ip.clone());
 					}
 				}

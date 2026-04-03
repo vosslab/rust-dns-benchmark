@@ -48,7 +48,7 @@ pub struct Cli {
 	pub concurrency: usize,
 
 	/// Inter-query spacing in milliseconds
-	#[arg(long = "spacing", default_value = "5")]
+	#[arg(long = "spacing", default_value = "25")]
 	pub spacing: u64,
 
 	/// Also query AAAA records
@@ -142,4 +142,12 @@ pub struct Cli {
 	/// Massive-scale scan: load ~11K public resolvers, discover survivors, benchmark with 30 rounds
 	#[arg(long = "scan")]
 	pub scan: bool,
+
+	/// Exhaustive test: load ALL resolver lists (built-in + US scan + global), discover survivors, benchmark thoroughly
+	#[arg(long = "exhaustive")]
+	pub exhaustive: bool,
+
+	/// Disable JSONL telemetry log (dns_benchmark.jsonl)
+	#[arg(long = "no-log")]
+	pub no_log: bool,
 }

@@ -5,3 +5,6 @@ report_ascii_compliance.txt
 report_bandit.txt
 report_pyright.txt
 /target
+nameservers.txt
+resolvers/scan_global.txt
+dns_benchmark.jsonl

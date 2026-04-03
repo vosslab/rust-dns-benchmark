@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-04-03
+
+### Additions and New Features
+- Added `--exhaustive` flag for full global DNS benchmark: auto-downloads ~63K nameservers from public-dns.info, combines with all built-in lists (IPv4, IPv6, DoH, DoT), forces discovery and 30 rounds
+- Added JSONL telemetry log (`dns_benchmark.jsonl`): logs config, pipeline stages, sidelined resolvers, round completions, and final results. Enabled by default, disable with `--no-log`
+- `--scan` mode now includes built-in resolver lists (Google, Cloudflare, Quad9, etc.) alongside the US scan list, fixing missing well-known resolvers from results
+
+### Behavior or Interface Changes
+- Changed default query spacing from 5ms to 25ms with random jitter (0-50%), reducing load on DNS servers. GRC uses 20ms; our new default of 25-37ms is gentler
+- Pipeline summary now shows `--top N` filter value so users understand why resolvers were filtered (e.g., "After discovery: 50 (--top 50 filter applied)")
+- `resolvers/scan_global.txt` and `dns_benchmark.jsonl` added to `.gitignore` (downloaded/generated files)
+
 ## 2026-04-02
 
 ### Additions and New Features

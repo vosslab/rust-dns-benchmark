@@ -6,6 +6,7 @@ mod output;
 mod rdns;
 mod resolver;
 mod stats;
+mod telemetry;
 mod transport;
 
 use clap::Parser;
@@ -72,18 +73,34 @@ async fn run() -> anyhow::Result<()> {
 		resolvers.extend(resolver::read_resolver_file(path)?);
 	}
 
-	// Scan mode: load ~11K public resolvers for massive-scale testing
-	if cli.scan {
+	// Exhaustive mode: load ~63K global public resolvers
+	if cli.exhaustive {
+		let mut global_list = resolver::scan_global_resolvers();
+		if global_list.is_empty() {
+			// Auto-download fresh nameserver list
+			println!("Downloading global nameserver list from public-dns.info...");
+			let global_path = resolver::download_global_list().await?;
+			global_list = resolver::read_resolver_file(&global_path)?;
+		}
+		if global_list.is_empty() {
+			anyhow::bail!("Global scan list is empty after download. Cannot run --exhaustive mode.");
+		}
+		println!("Exhaustive mode: loading {} global public resolvers", global_list.len());
+		resolvers.extend(global_list);
+	}
+
+	// Scan mode: load ~11K US public resolvers for massive-scale testing
+	if cli.scan && !cli.exhaustive {
 		let scan_list = resolver::scan_resolvers();
 		if scan_list.is_empty() {
 			anyhow::bail!("Scan list not found (resolvers/scan_us.txt). Cannot run --scan mode.");
 		}
-		println!("Scan mode: loading {} public resolvers for massive-scale test", scan_list.len());
+		println!("Scan mode: loading {} US public resolvers for massive-scale test", scan_list.len());
 		resolvers.extend(scan_list);
 	}
 
-	// When no resolvers explicitly specified (and not scanning), load the master lists by default
-	if !user_specified && !cli.scan {
+	// Load built-in resolver lists (always, unless user specified explicit resolvers)
+	if !user_specified {
 		resolvers.extend(resolver::default_resolvers());
 		if !cli.no_ipv6_resolvers {
 			resolvers.extend(resolver::default_ipv6_resolvers());
@@ -138,16 +155,16 @@ async fn run() -> anyhow::Result<()> {
 	// Build benchmark config
 	let query_tld = !cli.no_tld;
 	// Auto-enable discovery when resolver list is large (>20) unless disabled
-	// Scan mode always forces discovery on
-	let discover = if cli.scan {
+	// Scan and exhaustive modes always force discovery on
+	let discover = if cli.scan || cli.exhaustive {
 		true
 	} else if cli.no_discover {
 		false
 	} else {
 		cli.discover || resolvers.len() > 20
 	};
-	// Scan mode overrides rounds to 30 for thorough testing
-	let rounds = if cli.scan { 30 } else { cli.rounds };
+	// Scan/exhaustive modes override rounds to 30 for thorough testing
+	let rounds = if cli.scan || cli.exhaustive { 30 } else { cli.rounds };
 	let query_dotcom = !cli.no_dotcom;
 	let query_dnssec_domains = cli.dnssec;
 	let config = BenchmarkConfig {
@@ -170,10 +187,16 @@ async fn run() -> anyhow::Result<()> {
 		char_timeout: Duration::from_millis(cli.char_timeout),
 		char_attempts: cli.char_attempts,
 		query_dnssec_domains,
+		telemetry: telemetry::TelemetryLog::new(!cli.no_log),
 	};
+
+	// Determine run mode for telemetry
+	let mode = if cli.exhaustive { "exhaustive" } else if cli.scan { "scan" } else { "default" };
+	config.telemetry.log_config(rounds, cli.top, cli.spacing, mode, resolvers.len());
 
 	// Track resolver counts through the pipeline
 	let initial_count = resolvers.len();
+	config.telemetry.log_pipeline("loaded", initial_count);
 
 	// Print configuration summary
 	output::print_config_summary(
@@ -195,12 +218,14 @@ async fn run() -> anyhow::Result<()> {
 	}
 
 	let post_discovery_count = resolvers.len();
+	config.telemetry.log_pipeline("after_discovery", post_discovery_count);
 
 	// Run reverse DNS (PTR) lookups and NXDOMAIN interception characterization
 	rdns::resolve_ptr_names(&mut resolvers, config.timeout).await;
 	bench::run_characterization(&mut resolvers, &config, &nxdomain_domains).await;
 
 	let post_char_count = resolvers.len();
+	config.telemetry.log_pipeline("after_characterization", post_char_count);
 
 	// Run benchmark
 	println!("Running benchmark...");
@@ -247,10 +272,16 @@ async fn run() -> anyhow::Result<()> {
 		r.tie_group = None;
 	}
 
+	// Log final results to telemetry
+	for r in &results {
+		config.telemetry.log_result(r.rank, &r.stats.addr, &r.stats.label, r.stats.warm.score, r.stats.warm.p50_ms);
+	}
+
 	// Print pipeline summary
 	let final_count = results.len();
+	config.telemetry.log_pipeline("final_results", final_count);
 	output::print_pipeline_summary(
-		initial_count, post_discovery_count, post_char_count, final_count,
+		initial_count, post_discovery_count, post_char_count, final_count, cli.top,
 	);
 
 	// Print results table and conclusions

@@ -344,6 +344,34 @@ pub fn scan_resolvers() -> Vec<ResolverConfig> {
 	find_resolver_file("scan_us.txt").unwrap_or_default()
 }
 
+/// Return the global scan list from scan_global.txt (~63K worldwide public resolvers).
+pub fn scan_global_resolvers() -> Vec<ResolverConfig> {
+	find_resolver_file("scan_global.txt").unwrap_or_default()
+}
+
+/// Download the global nameserver list from public-dns.info to resolvers/scan_global.txt.
+/// Returns the path to the downloaded file.
+pub async fn download_global_list() -> Result<String> {
+	let url = "https://public-dns.info/nameservers.txt";
+	let response = reqwest::get(url).await
+		.map_err(|e| anyhow!("Failed to download nameserver list: {}", e))?;
+	let body = response.text().await
+		.map_err(|e| anyhow!("Failed to read nameserver list response: {}", e))?;
+
+	// Write to resolvers/ directory if it exists, otherwise current directory
+	let path = if std::path::Path::new("resolvers").is_dir() {
+		"resolvers/scan_global.txt".to_string()
+	} else {
+		"scan_global.txt".to_string()
+	};
+	std::fs::write(&path, &body)
+		.map_err(|e| anyhow!("Failed to write {}: {}", path, e))?;
+
+	let line_count = body.lines().filter(|l| !l.trim().is_empty()).count();
+	println!("  Downloaded {} nameservers to {}", line_count, path);
+	Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

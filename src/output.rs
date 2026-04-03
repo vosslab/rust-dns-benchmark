@@ -258,12 +258,13 @@ pub fn print_pipeline_summary(
 	post_discovery: usize,
 	post_char: usize,
 	final_count: usize,
+	top_n: usize,
 ) {
 	println!("\nResolver Pipeline");
 	println!("-----------------");
 	println!("  Started:              {}", initial);
 	if post_discovery != initial {
-		println!("  After discovery:      {}", post_discovery);
+		println!("  After discovery:      {} (--top {} filter applied)", post_discovery, top_n);
 	}
 	if post_char != post_discovery {
 		println!("  After characterization: {}", post_char);
