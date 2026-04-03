@@ -3,6 +3,11 @@
 ## 2026-04-02
 
 ### Additions and New Features
+- Added colored output to results table: score/latency green/yellow/red by threshold, success rate colored, NXDOMAIN/DNSSEC/rebind status colored, top-3 ranks bold green
+- Added `--save-resolvers` CLI flag to export surviving resolver list to a file after benchmark
+- Added conclusions summary printed after results table: fastest resolver, system resolver ranking, performance comparison, NXDOMAIN interception warnings
+- Added real-time progress indicator during benchmark rounds showing queries completed and percentage
+- Added explicit exit codes for scripting: 0=success, 1=file not found, 4=no resolvers, 5=no connectivity
 - Added DNS over TLS (DoT) transport support via `tls://` prefix (e.g., `tls://1.1.1.1`)
 - Added DNS over HTTPS (DoH) transport support via `https://` prefix (e.g., `https://1.1.1.1/dns-query`)
 - Added transport dispatch layer: `dispatch_query()` routes queries to UDP, DoT, or DoH based on resolver config

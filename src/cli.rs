@@ -79,6 +79,10 @@ pub struct Cli {
 	#[arg(short = 'o', long = "output")]
 	pub output: Option<String>,
 
+	/// Save surviving resolver list to file (one per line)
+	#[arg(long = "save-resolvers")]
+	pub save_resolvers: Option<String>,
+
 	/// Random seed for reproducible results
 	#[arg(short = 's', long = "seed")]
 	pub seed: Option<u64>,

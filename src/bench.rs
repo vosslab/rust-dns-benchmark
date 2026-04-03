@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -712,14 +713,29 @@ pub async fn run_benchmark(
 		.collect();
 
 	for round in 0..config.rounds {
-		println!("  Round {}/{}", round + 1, config.rounds);
-
 		// Filter out sidelined resolvers for this round
 		let mut round_tasks = tasks.clone();
 		if !sidelined.is_empty() {
 			round_tasks.retain(|t| !sidelined.contains(&t.resolver.addr.ip().to_string()));
 		}
 		round_tasks.shuffle(&mut rng);
+
+		let round_total = round_tasks.len();
+		let completed_count = Arc::new(AtomicUsize::new(0));
+
+		// Progress monitor: print status every 500ms
+		let progress_counter = completed_count.clone();
+		let round_num = round + 1;
+		let total_rounds = config.rounds;
+		let monitor = tokio::spawn(async move {
+			loop {
+				tokio::time::sleep(Duration::from_millis(500)).await;
+				let done = progress_counter.load(Ordering::Relaxed);
+				let pct = if round_total > 0 { done * 100 / round_total } else { 100 };
+				eprint!("\r  Round {}/{}: {}/{} queries ({}%)",
+					round_num, total_rounds, done, round_total, pct);
+			}
+		});
 
 		// Spawn all query tasks for this round
 		let mut handles = Vec::new();
@@ -729,6 +745,7 @@ pub async fn run_benchmark(
 			let spacing = config.inter_query_spacing;
 			let dnssec = config.dnssec;
 			let doh_clients = doh_clients.clone();
+			let progress = completed_count.clone();
 
 			handles.push(tokio::spawn(async move {
 				// Acquire semaphore permit for concurrency control
@@ -767,6 +784,9 @@ pub async fn run_benchmark(
 					&doh_clients,
 				).await;
 
+				// Increment progress counter
+				progress.fetch_add(1, Ordering::Relaxed);
+
 				(task, result)
 			}));
 		}
@@ -782,6 +802,11 @@ pub async fn run_benchmark(
 				}
 			}
 		}
+
+		// Stop progress monitor and print final line for this round
+		monitor.abort();
+		eprint!("\r  Round {}/{}: {}/{} queries (100%)    \n",
+			round + 1, config.rounds, round_total, round_total);
 
 		// Mid-benchmark sidelining: check for slow/dead resolvers after each round
 		if config.sideline && round < config.rounds - 1 {

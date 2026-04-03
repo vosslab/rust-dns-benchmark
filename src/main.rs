@@ -9,13 +9,34 @@ mod stats;
 mod transport;
 
 use clap::Parser;
+use std::process::ExitCode;
 use std::time::Duration;
 
 use crate::cli::Cli;
 use crate::transport::BenchmarkConfig;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> ExitCode {
+	match run().await {
+		Ok(()) => ExitCode::from(0),
+		Err(e) => {
+			let msg = format!("{}", e);
+			eprintln!("Error: {}", msg);
+			// Map error messages to GRC-compatible exit codes
+			if msg.contains("No such file") || msg.contains("not found") {
+				ExitCode::from(1)
+			} else if msg.contains("no resolvers") || msg.contains("No resolvers") {
+				ExitCode::from(4)
+			} else if msg.contains("no connectivity") || msg.contains("No connectivity") {
+				ExitCode::from(5)
+			} else {
+				ExitCode::from(1)
+			}
+		}
+	}
+}
+
+async fn run() -> anyhow::Result<()> {
 	let cli = Cli::parse();
 
 	// Collect resolvers from all sources
@@ -43,6 +64,11 @@ async fn main() -> anyhow::Result<()> {
 		// Deduplicate: skip system resolvers already in the list
 		sys.retain(|s| !resolvers.iter().any(|r| r.addr.ip() == s.addr.ip()));
 		resolvers.extend(sys);
+	}
+
+	// Bail early if no resolvers to test
+	if resolvers.is_empty() {
+		anyhow::bail!("No resolvers to test. Provide resolvers via -r, -f, or system defaults.");
 	}
 
 	// Collect domains from files or defaults
@@ -156,12 +182,18 @@ async fn main() -> anyhow::Result<()> {
 		r.tie_group = None;
 	}
 
-	// Print results table
+	// Print results table and conclusions
 	output::print_results_table(&results, config.query_tld);
+	output::print_conclusions(&results);
 
 	// Write CSV if requested
 	if let Some(path) = &cli.output {
 		output::write_csv(path, &results, config.query_tld)?;
+	}
+
+	// Save resolver list if requested
+	if let Some(path) = &cli.save_resolvers {
+		output::write_resolver_list(path, &results)?;
 	}
 
 	Ok(())

@@ -10,7 +10,7 @@ tokio = { version = "1", features = ["full"] }
 hickory-proto = "0.25"
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
-comfy-table = "7"
+comfy-table = { version = "7", features = ["custom_styling"] }
 csv = "1"
 anyhow = "1"
 thiserror = "1"

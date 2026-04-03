@@ -1,9 +1,32 @@
-use comfy_table::{Table, ContentArrangement, presets::UTF8_FULL};
+use comfy_table::{Table, ContentArrangement, Cell, Color, Attribute, presets::UTF8_FULL};
 
 use anyhow::Result;
+use std::io::Write;
 
 use crate::stats::ScoredResolver;
 use crate::transport::{BenchmarkConfig, ResolverConfig};
+
+/// Pick a color for a latency or score value (lower is better).
+fn latency_color(ms: f64) -> Color {
+	if ms < 30.0 {
+		Color::Green
+	} else if ms < 100.0 {
+		Color::Yellow
+	} else {
+		Color::Red
+	}
+}
+
+/// Pick a color for success rate percentage (higher is better).
+fn success_color(pct: f64) -> Color {
+	if pct >= 99.0 {
+		Color::Green
+	} else if pct >= 90.0 {
+		Color::Yellow
+	} else {
+		Color::Red
+	}
+}
 
 /// Print a summary of the benchmark configuration before running.
 pub fn print_config_summary(
@@ -63,7 +86,7 @@ pub fn print_config_summary(
 	println!();
 }
 
-/// Print the benchmark results as a formatted table.
+/// Print the benchmark results as a formatted table with color coding.
 pub fn print_results_table(results: &[ScoredResolver], show_tld: bool) {
 	let mut table = Table::new();
 	table.load_preset(UTF8_FULL);
@@ -103,10 +126,20 @@ pub fn print_results_table(results: &[ScoredResolver], show_tld: bool) {
 			None => format!("{}", r.rank),
 		};
 
-		let nxdomain_str = if s.intercepts_nxdomain {
-			"Intercepts".to_string()
+		// Color the rank cell based on position
+		let rank_cell = if r.rank <= 3 {
+			Cell::new(rank_str).fg(Color::Green).add_attribute(Attribute::Bold)
+		} else if r.rank <= 10 {
+			Cell::new(rank_str).add_attribute(Attribute::Bold)
 		} else {
-			"OK".to_string()
+			Cell::new(rank_str)
+		};
+
+		// NXDOMAIN status with color
+		let nxdomain_cell = if s.intercepts_nxdomain {
+			Cell::new("Intercepts").fg(Color::Red)
+		} else {
+			Cell::new("OK").fg(Color::Green)
 		};
 
 		// Build label with optional system marker and PTR name
@@ -121,41 +154,56 @@ pub fn print_results_table(results: &[ScoredResolver], show_tld: bool) {
 			label = format!("{} [sys]", label);
 		}
 
-		let mut row = vec![
-			rank_str,
-			label,
-			s.addr.clone(),
+		// Build row with colored cells
+		let mut row: Vec<Cell> = vec![
+			rank_cell,
+			Cell::new(label),
+			Cell::new(s.addr.clone()),
 		];
 		if has_mixed_transport {
-			row.push(s.transport.clone());
+			row.push(Cell::new(s.transport.clone()));
 		}
-		row.extend_from_slice(&[
-			format!("{:.1}", s.overall_score),
-			format!("{:.1} ms", s.warm.p50_ms),
-			format!("{:.1} ms", s.cold.p50_ms),
-		]);
+
+		// Score and latency cells with color
+		let score_text = format!("{:.1}", s.overall_score);
+		row.push(Cell::new(&score_text).fg(latency_color(s.overall_score)));
+
+		let warm_text = format!("{:.1} ms", s.warm.p50_ms);
+		row.push(Cell::new(&warm_text).fg(latency_color(s.warm.p50_ms)));
+
+		let cold_text = format!("{:.1} ms", s.cold.p50_ms);
+		row.push(Cell::new(&cold_text).fg(latency_color(s.cold.p50_ms)));
+
 		if show_tld {
 			if let Some(ref tld) = s.tld {
-				row.push(format!("{:.1} ms", tld.p50_ms));
+				let tld_text = format!("{:.1} ms", tld.p50_ms);
+				row.push(Cell::new(&tld_text).fg(latency_color(tld.p50_ms)));
 			} else {
-				row.push("-".to_string());
+				row.push(Cell::new("-"));
 			}
 		}
-		let dnssec_str = match s.validates_dnssec {
-			Some(true) => "Yes".to_string(),
-			Some(false) => "No".to_string(),
-			None => "-".to_string(),
-		};
-		let rebind_str = match s.rebinding_protection {
-			Some(true) => "Yes".to_string(),
-			Some(false) => "No".to_string(),
-			None => "-".to_string(),
-		};
 
-		row.push(format!("{:.1}%", s.success_rate));
-		row.push(nxdomain_str);
-		row.push(dnssec_str);
-		row.push(rebind_str);
+		// Success rate with color
+		let success_text = format!("{:.1}%", s.success_rate);
+		row.push(Cell::new(&success_text).fg(success_color(s.success_rate)));
+
+		row.push(nxdomain_cell);
+
+		// DNSSEC cell with color
+		let dnssec_cell = match s.validates_dnssec {
+			Some(true) => Cell::new("Yes").fg(Color::Green),
+			Some(false) => Cell::new("No"),
+			None => Cell::new("-").fg(Color::DarkGrey),
+		};
+		row.push(dnssec_cell);
+
+		// Rebinding protection cell with color
+		let rebind_cell = match s.rebinding_protection {
+			Some(true) => Cell::new("Yes").fg(Color::Green),
+			Some(false) => Cell::new("No"),
+			None => Cell::new("-").fg(Color::DarkGrey),
+		};
+		row.push(rebind_cell);
 
 		table.add_row(row);
 	}
@@ -166,6 +214,49 @@ pub fn print_results_table(results: &[ScoredResolver], show_tld: bool) {
 
 	if has_ties {
 		println!("\nNote: resolvers with shared rank (e.g. 1-3) are statistically tied.");
+	}
+}
+
+/// Print heuristic conclusions about the benchmark results.
+pub fn print_conclusions(results: &[ScoredResolver]) {
+	if results.is_empty() {
+		return;
+	}
+	println!("\nConclusions");
+	println!("===========\n");
+
+	// Find the best resolver overall
+	let best = &results[0];
+	println!("Fastest resolver: {} (score {:.1})", best.stats.label, best.stats.overall_score);
+
+	// Report on system resolvers
+	let total = results.len();
+	for r in results {
+		if !r.is_system {
+			continue;
+		}
+		println!(
+			"Your system resolver {} ranked #{} out of {} tested.",
+			r.stats.label, r.rank, total,
+		);
+		// Compare to best
+		if r.rank > 1 && best.stats.overall_score > 0.0 {
+			let pct_slower = ((r.stats.overall_score - best.stats.overall_score)
+				/ best.stats.overall_score) * 100.0;
+			if pct_slower > 20.0 {
+				println!(
+					"  Switching to {} could improve DNS performance by ~{:.0}%.",
+					best.stats.label, pct_slower,
+				);
+			}
+		}
+		// Warn about NXDOMAIN interception on system resolver
+		if r.stats.intercepts_nxdomain {
+			println!(
+				"  Warning: {} intercepts NXDOMAIN queries (ad-redirect behavior).",
+				r.stats.label,
+			);
+		}
 	}
 }
 
@@ -263,5 +354,18 @@ pub fn write_csv(path: &str, results: &[ScoredResolver], show_tld: bool) -> Resu
 
 	writer.flush()?;
 	println!("\nResults written to: {}", path);
+	Ok(())
+}
+
+/// Save surviving resolver addresses to a file (one per line, IP  # Label).
+pub fn write_resolver_list(path: &str, results: &[ScoredResolver]) -> Result<()> {
+	let mut file = std::fs::File::create(path)?;
+	writeln!(file, "# DNS Benchmark - surviving resolvers (ranked by performance)")?;
+	for r in results {
+		let s = &r.stats;
+		// Write in resolver file format: address  # Label
+		writeln!(file, "{}  # {}", s.addr, s.label)?;
+	}
+	println!("\nResolver list written to: {}", path);
 	Ok(())
 }
