@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use comfy_table::{Table, ContentArrangement, Cell, Color, Attribute, presets::UTF8_FULL};
 
 use anyhow::Result;
@@ -29,18 +30,20 @@ fn success_color(pct: f64) -> Color {
 }
 
 /// Print a summary of the benchmark configuration before running.
+///
+/// Displays three clearly separated sections:
+/// 1. Resolvers under test (DNS servers being benchmarked)
+/// 2. Query domains (websites queried against each resolver)
+/// 3. Timing and options (benchmark parameters)
 pub fn print_config_summary(
 	resolvers: &[ResolverConfig],
-	warm_count: usize,
-	cold_count: usize,
-	tld_count: usize,
-	dotcom_count: usize,
-	dnssec_count: usize,
+	categories: &BTreeMap<String, Vec<String>>,
 	config: &BenchmarkConfig,
 ) {
-	println!("DNS Benchmark Configuration");
-	println!("===========================");
-	println!("Resolvers:      {}", resolvers.len());
+	// Section 1: Resolvers under test
+	println!("DNS Benchmark");
+	println!("=============");
+	println!("Resolvers under test: {}", resolvers.len());
 	if resolvers.len() <= 20 {
 		for r in resolvers {
 			println!("  - {} ({})", r.label, r.addr);
@@ -55,44 +58,66 @@ pub fn print_config_summary(
 			println!("  - {} ({})", r.label, r.addr);
 		}
 	}
-	println!("Warm domains:   {}", warm_count);
-	println!("Cold domains:   {}", cold_count);
-	println!("TLD domains:    {}", tld_count);
-	println!("Dotcom domains: {}", dotcom_count);
-	if config.query_dnssec_domains {
-		println!("DNSSEC domains: {}", dnssec_count);
+
+	// Section 2: Query domains (what we send to each resolver)
+	println!();
+	let total_domains: usize = categories.values().map(|v| v.len()).sum();
+	println!("Query domains ({} total, sent to each resolver):", total_domains);
+	for (category, domains) in categories {
+		// Show a few example domains for context
+		let examples: Vec<&str> = domains.iter().take(3).map(|s| s.as_str()).collect();
+		let example_str = examples.join(", ");
+		if domains.len() > 3 {
+			println!("  {:<12} {:>3}  ({}, ...)", category, domains.len(), example_str);
+		} else {
+			println!("  {:<12} {:>3}  ({})", category, domains.len(), example_str);
+		}
 	}
-	println!("Char timeout:   {} ms", crate::transport::DEFAULT_CHAR_TIMEOUT_MS);
-	println!("Char attempts:  {}", crate::transport::DEFAULT_CHAR_ATTEMPTS);
-	println!("Rounds:         {}", config.rounds);
-	println!("Timeout:        {} ms", config.timeout.as_millis());
-	println!("Concurrency:    {}", config.max_inflight);
-	println!("Spacing:        {} ms", config.inter_query_spacing.as_millis());
+
+	// Section 3: Timing and options
+	println!();
+	println!("Timing and options:");
+	println!("  Rounds:       {}", config.rounds);
+	println!("  Timeout:      {} ms", config.timeout.as_millis());
+	println!("  Char timeout: {} ms", crate::transport::DEFAULT_CHAR_TIMEOUT_MS);
+	println!("  Char attempts:{}", crate::transport::DEFAULT_CHAR_ATTEMPTS);
+	println!("  Concurrency:  {}", config.max_inflight);
+	println!("  Spacing:      {} ms", config.inter_query_spacing.as_millis());
 	let aaaa_label = if config.query_aaaa { "yes" } else { "no" };
-	println!("Query AAAA:     {}", aaaa_label);
+	println!("  Query AAAA:   {}", aaaa_label);
 	let dnssec_label = if config.dnssec { "yes" } else { "no" };
-	println!("DNSSEC (DO):    {}", dnssec_label);
+	println!("  DNSSEC (DO):  {}", dnssec_label);
 	if config.discover {
-		println!("Discovery:      top {}", config.top_n);
+		println!("  Discovery:    top {}", config.top_n);
 	}
-	let sort_label = match config.sort_mode {
-		crate::stats::SortMode::Score => "overall score",
-		crate::stats::SortMode::Warm => "warm (cached) p50",
-		crate::stats::SortMode::Cold => "cold (uncached) p50",
-		crate::stats::SortMode::Tld => "TLD p50",
-		crate::stats::SortMode::Dotcom => "dotcom p50",
-		crate::stats::SortMode::Name => "name",
+	let sort_label = match &config.sort_mode {
+		crate::stats::SortMode::Score => "overall score".to_string(),
+		crate::stats::SortMode::Category(name) => format!("{} p50", name),
+		crate::stats::SortMode::Name => "name".to_string(),
 	};
-	println!("Sort by:        {}", sort_label);
-	println!("Pin system:     yes");
+	println!("  Sort by:      {}", sort_label);
+	println!("  Pin system:   yes");
 	if let Some(seed) = config.seed {
-		println!("Seed:           {}", seed);
+		println!("  Seed:         {}", seed);
 	}
 	println!();
 }
 
+/// Collect the ordered list of category names present in results.
+fn result_category_names(results: &[ScoredResolver]) -> Vec<String> {
+	let mut names: BTreeMap<String, ()> = BTreeMap::new();
+	for r in results {
+		for key in r.stats.categories.keys() {
+			names.entry(key.clone()).or_default();
+		}
+	}
+	names.into_keys().collect()
+}
+
 /// Print the benchmark results as a formatted table with color coding.
-pub fn print_results_table(results: &[ScoredResolver], show_tld: bool, show_dotcom: bool, show_dnssec: bool) {
+pub fn print_results_table(results: &[ScoredResolver]) {
+	let category_names = result_category_names(results);
+
 	let mut table = Table::new();
 	table.load_preset(UTF8_FULL);
 	table.set_content_arrangement(ContentArrangement::Dynamic);
@@ -101,28 +126,25 @@ pub fn print_results_table(results: &[ScoredResolver], show_tld: bool, show_dotc
 	let has_mixed_transport = results.iter()
 		.any(|r| r.stats.transport != "UDP");
 
-	// Build header
-	let mut header = vec![
-		"Rank", "Resolver", "IP Address",
+	// Build header dynamically
+	let mut header: Vec<String> = vec![
+		"Rank".to_string(), "Resolver".to_string(), "IP Address".to_string(),
 	];
 	if has_mixed_transport {
-		header.push("Proto");
+		header.push("Proto".to_string());
 	}
-	header.extend_from_slice(&["Score", "Warm p50", "Cold p50"]);
-	if show_tld {
-		header.push("TLD p50");
+	header.push("Score".to_string());
+	// Add a p50 column for each category
+	for cat in &category_names {
+		header.push(format!("{} p50", cat));
 	}
-	if show_dotcom {
-		header.push("DotCom p50");
-	}
-	if show_dnssec {
-		header.push("DNSSEC p50");
-	}
-	header.push("Success %");
-	header.push("NXDOMAIN");
-	header.push("DNSSEC");
-	header.push("Rebind");
-	table.set_header(header);
+	header.push("Success %".to_string());
+	header.push("NXDOMAIN".to_string());
+	header.push("DNSSEC".to_string());
+	header.push("Rebind".to_string());
+
+	let header_cells: Vec<Cell> = header.iter().map(|h| Cell::new(h)).collect();
+	table.set_header(header_cells);
 
 	let mut has_ties = false;
 	for r in results {
@@ -175,38 +197,15 @@ pub fn print_results_table(results: &[ScoredResolver], show_tld: bool, show_dotc
 			row.push(Cell::new(s.transport.clone()));
 		}
 
-		// Score and latency cells with color
+		// Score cell with color
 		let score_text = format!("{:.1}", s.overall_score);
 		row.push(Cell::new(&score_text).fg(latency_color(s.overall_score)));
 
-		let warm_text = format!("{:.1} ms", s.warm.p50_ms);
-		row.push(Cell::new(&warm_text).fg(latency_color(s.warm.p50_ms)));
-
-		let cold_text = format!("{:.1} ms", s.cold.p50_ms);
-		row.push(Cell::new(&cold_text).fg(latency_color(s.cold.p50_ms)));
-
-		if show_tld {
-			if let Some(ref tld) = s.tld {
-				let tld_text = format!("{:.1} ms", tld.p50_ms);
-				row.push(Cell::new(&tld_text).fg(latency_color(tld.p50_ms)));
-			} else {
-				row.push(Cell::new("-"));
-			}
-		}
-
-		if show_dotcom {
-			if let Some(ref dc) = s.dotcom {
-				let dc_text = format!("{:.1} ms", dc.p50_ms);
-				row.push(Cell::new(&dc_text).fg(latency_color(dc.p50_ms)));
-			} else {
-				row.push(Cell::new("-"));
-			}
-		}
-
-		if show_dnssec {
-			if let Some(ref ds) = s.dnssec_bench {
-				let ds_text = format!("{:.1} ms", ds.p50_ms);
-				row.push(Cell::new(&ds_text).fg(latency_color(ds.p50_ms)));
+		// Category p50 columns
+		for cat in &category_names {
+			if let Some(cat_stats) = s.categories.get(cat) {
+				let text = format!("{:.1} ms", cat_stats.p50_ms);
+				row.push(Cell::new(&text).fg(latency_color(cat_stats.p50_ms)));
 			} else {
 				row.push(Cell::new("-"));
 			}
@@ -315,13 +314,21 @@ pub fn print_conclusions(results: &[ScoredResolver]) {
 		}
 	}
 
-	// Warn if all resolvers are slow
-	let all_slow = results.iter().all(|r| r.stats.warm.p50_ms > 100.0);
-	if all_slow {
-		println!("  Warning: all tested resolvers have warm p50 > 100 ms. Your network may have high latency.");
+	// Warn if all resolvers are slow (check first category as proxy)
+	let first_cat = result_category_names(results).into_iter().next();
+	if let Some(cat_name) = first_cat {
+		let all_slow = results.iter().all(|r| {
+			r.stats.categories.get(&cat_name)
+				.map(|s| s.p50_ms > 100.0)
+				.unwrap_or(true)
+		});
+		if all_slow {
+			println!("  Warning: all tested resolvers have {} p50 > 100 ms. Your network may have high latency.", cat_name);
+		}
 	}
 
 	// IPv4 vs IPv6 comparison for same-provider pairs
+	let first_cat_name = result_category_names(results).into_iter().next();
 	let mut pairs_printed = false;
 	for r in results {
 		// Look for a matching -v6 suffix entry
@@ -341,47 +348,43 @@ pub fn print_conclusions(results: &[ScoredResolver]) {
 					0.0
 				};
 				let direction = if diff_pct > 0.0 { "slower" } else { "faster" };
-				println!("  {} IPv4: {:.1} ms vs IPv6: {:.1} ms ({:.0}% {})",
-					base_label, r.stats.warm.p50_ms, v6.stats.warm.p50_ms,
-					diff_pct.abs(), direction);
+				// Use first category p50 for the comparison display
+				if let Some(ref cat) = first_cat_name {
+					let v4_p50 = r.stats.categories.get(cat).map(|s| s.p50_ms).unwrap_or(0.0);
+					let v6_p50 = v6.stats.categories.get(cat).map(|s| s.p50_ms).unwrap_or(0.0);
+					println!("  {} IPv4: {:.1} ms vs IPv6: {:.1} ms ({:.0}% {})",
+						base_label, v4_p50, v6_p50, diff_pct.abs(), direction);
+				}
 			}
 		}
 	}
 }
 
 /// Write benchmark results to a CSV file.
-pub fn write_csv(path: &str, results: &[ScoredResolver], show_tld: bool, show_dotcom: bool, show_dnssec: bool) -> Result<()> {
+pub fn write_csv(path: &str, results: &[ScoredResolver]) -> Result<()> {
+	let category_names = result_category_names(results);
 	let mut writer = csv::Writer::from_path(path)?;
 
-	// Build header
-	let mut header = vec![
-		"rank", "resolver", "ip_address", "transport", "overall_score",
-		"warm_p50_ms", "warm_p95_ms", "warm_mean_ms", "warm_stddev_ms",
-		"warm_success", "warm_timeout", "warm_total", "warm_score",
-		"cold_p50_ms", "cold_p95_ms", "cold_mean_ms", "cold_stddev_ms",
-		"cold_success", "cold_timeout", "cold_total", "cold_score",
+	// Build header dynamically
+	let mut header: Vec<String> = vec![
+		"rank".to_string(), "resolver".to_string(), "ip_address".to_string(),
+		"transport".to_string(), "overall_score".to_string(),
 	];
-	if show_tld {
-		header.extend_from_slice(&[
-			"tld_p50_ms", "tld_p95_ms", "tld_mean_ms", "tld_stddev_ms",
-			"tld_success", "tld_timeout", "tld_total", "tld_score",
-		]);
-	}
-	if show_dotcom {
-		header.extend_from_slice(&[
-			"dotcom_p50_ms", "dotcom_p95_ms", "dotcom_mean_ms", "dotcom_stddev_ms",
-			"dotcom_success", "dotcom_timeout", "dotcom_total", "dotcom_score",
-		]);
-	}
-	if show_dnssec {
-		header.extend_from_slice(&[
-			"dnssec_p50_ms", "dnssec_p95_ms", "dnssec_mean_ms", "dnssec_stddev_ms",
-			"dnssec_success", "dnssec_timeout", "dnssec_total", "dnssec_score",
-		]);
+	// Add 8 columns per category (p50, p95, mean, stddev, success, timeout, total, score)
+	for cat in &category_names {
+		header.push(format!("{}_p50_ms", cat));
+		header.push(format!("{}_p95_ms", cat));
+		header.push(format!("{}_mean_ms", cat));
+		header.push(format!("{}_stddev_ms", cat));
+		header.push(format!("{}_success", cat));
+		header.push(format!("{}_timeout", cat));
+		header.push(format!("{}_total", cat));
+		header.push(format!("{}_score", cat));
 	}
 	header.extend_from_slice(&[
-		"success_rate", "intercepts_nxdomain", "validates_dnssec",
-		"rebinding_protection", "ptr_name", "tie_group",
+		"success_rate".to_string(), "intercepts_nxdomain".to_string(),
+		"validates_dnssec".to_string(), "rebinding_protection".to_string(),
+		"ptr_name".to_string(), "tie_group".to_string(),
 	]);
 	writer.write_record(&header)?;
 
@@ -398,80 +401,30 @@ pub fn write_csv(path: &str, results: &[ScoredResolver], show_tld: bool, show_do
 			s.addr.clone(),
 			s.transport.clone(),
 			format!("{:.2}", s.overall_score),
-			format!("{:.2}", s.warm.p50_ms),
-			format!("{:.2}", s.warm.p95_ms),
-			format!("{:.2}", s.warm.mean_ms),
-			format!("{:.2}", s.warm.stddev_ms),
-			s.warm.success_count.to_string(),
-			s.warm.timeout_count.to_string(),
-			s.warm.total_count.to_string(),
-			format!("{:.2}", s.warm.score),
-			format!("{:.2}", s.cold.p50_ms),
-			format!("{:.2}", s.cold.p95_ms),
-			format!("{:.2}", s.cold.mean_ms),
-			format!("{:.2}", s.cold.stddev_ms),
-			s.cold.success_count.to_string(),
-			s.cold.timeout_count.to_string(),
-			s.cold.total_count.to_string(),
-			format!("{:.2}", s.cold.score),
 		];
-		if show_tld {
-			if let Some(ref tld) = s.tld {
+
+		// Category columns
+		for cat in &category_names {
+			if let Some(cs) = s.categories.get(cat) {
 				row.extend_from_slice(&[
-					format!("{:.2}", tld.p50_ms),
-					format!("{:.2}", tld.p95_ms),
-					format!("{:.2}", tld.mean_ms),
-					format!("{:.2}", tld.stddev_ms),
-					tld.success_count.to_string(),
-					tld.timeout_count.to_string(),
-					tld.total_count.to_string(),
-					format!("{:.2}", tld.score),
+					format!("{:.2}", cs.p50_ms),
+					format!("{:.2}", cs.p95_ms),
+					format!("{:.2}", cs.mean_ms),
+					format!("{:.2}", cs.stddev_ms),
+					cs.success_count.to_string(),
+					cs.timeout_count.to_string(),
+					cs.total_count.to_string(),
+					format!("{:.2}", cs.score),
 				]);
 			} else {
+				// Empty columns for missing category
 				row.extend_from_slice(&[
 					String::new(), String::new(), String::new(), String::new(),
 					String::new(), String::new(), String::new(), String::new(),
 				]);
 			}
 		}
-		if show_dotcom {
-			if let Some(ref dc) = s.dotcom {
-				row.extend_from_slice(&[
-					format!("{:.2}", dc.p50_ms),
-					format!("{:.2}", dc.p95_ms),
-					format!("{:.2}", dc.mean_ms),
-					format!("{:.2}", dc.stddev_ms),
-					dc.success_count.to_string(),
-					dc.timeout_count.to_string(),
-					dc.total_count.to_string(),
-					format!("{:.2}", dc.score),
-				]);
-			} else {
-				row.extend_from_slice(&[
-					String::new(), String::new(), String::new(), String::new(),
-					String::new(), String::new(), String::new(), String::new(),
-				]);
-			}
-		}
-		if show_dnssec {
-			if let Some(ref ds) = s.dnssec_bench {
-				row.extend_from_slice(&[
-					format!("{:.2}", ds.p50_ms),
-					format!("{:.2}", ds.p95_ms),
-					format!("{:.2}", ds.mean_ms),
-					format!("{:.2}", ds.stddev_ms),
-					ds.success_count.to_string(),
-					ds.timeout_count.to_string(),
-					ds.total_count.to_string(),
-					format!("{:.2}", ds.score),
-				]);
-			} else {
-				row.extend_from_slice(&[
-					String::new(), String::new(), String::new(), String::new(),
-					String::new(), String::new(), String::new(), String::new(),
-				]);
-			}
-		}
+
 		let intercepts_str = if s.intercepts_nxdomain { "true" } else { "false" };
 		let dnssec_csv = match s.validates_dnssec {
 			Some(true) => "true", Some(false) => "false", None => "",

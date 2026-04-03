@@ -1,83 +1,50 @@
+use std::collections::BTreeMap;
 use anyhow::{anyhow, Result};
 
-/// Return a list of popular domains likely to be cached by DNS resolvers.
-pub fn default_warm_domains() -> Vec<String> {
-	vec![
-		"google.com",
-		"youtube.com",
-		"facebook.com",
-		"amazon.com",
-		"wikipedia.org",
-		"twitter.com",
-		"reddit.com",
-		"netflix.com",
-		"microsoft.com",
-		"apple.com",
-	].into_iter().map(String::from).collect()
+/// Default query domains CSV, embedded at compile time.
+const DEFAULT_QUERY_DOMAINS_CSV: &str = include_str!("../query_domains.csv");
+
+/// Parse a query domains CSV string into a map of category -> domain list.
+///
+/// CSV format: domain,category (with header row).
+/// Categories are sorted alphabetically via BTreeMap for deterministic output.
+fn parse_query_domains_csv(csv_text: &str) -> BTreeMap<String, Vec<String>> {
+	let mut categories: BTreeMap<String, Vec<String>> = BTreeMap::new();
+	for line in csv_text.lines().skip(1) {
+		let line = line.trim();
+		if line.is_empty() || line.starts_with('#') {
+			continue;
+		}
+		// Split on first comma only
+		let parts: Vec<&str> = line.splitn(2, ',').collect();
+		if parts.len() != 2 {
+			continue;
+		}
+		let domain = parts[0].trim().to_string();
+		let category = parts[1].trim().to_string();
+		if !domain.is_empty() && !category.is_empty() {
+			categories.entry(category).or_default().push(domain);
+		}
+	}
+	categories
 }
 
-/// Return a list of real domains unlikely to be cached by resolvers.
+/// Load the built-in default query domains from the embedded CSV.
+pub fn load_default_query_domains() -> BTreeMap<String, Vec<String>> {
+	parse_query_domains_csv(DEFAULT_QUERY_DOMAINS_CSV)
+}
+
+/// Load query domains from a user-provided CSV file.
 ///
-/// These are real, resolvable domains across diverse TLDs. They should
-/// trigger actual uncached resolution rather than NXDOMAIN negative caching.
-pub fn default_cold_domains() -> Vec<String> {
-	vec![
-		// Government and institutional (.gov, .edu)
-		"archives.gov",
-		"usgs.gov",
-		"noaa.gov",
-		"energy.gov",
-		"census.gov",
-		"si.edu",
-		"caltech.edu",
-		"mit.edu",
-		"stanford.edu",
-		"cornell.edu",
-		// International research and institutions
-		"cern.ch",
-		"csiro.au",
-		"keio.ac.jp",
-		"ethz.ch",
-		"mpg.de",
-		"cnrs.fr",
-		"nrc.ca",
-		"anu.edu.au",
-		"cam.ac.uk",
-		"tudelft.nl",
-		// Country-code TLD variety
-		"ibge.gov.br",
-		"kb.se",
-		"onb.ac.at",
-		"nationaalarchief.nl",
-		"riksarkivet.no",
-		"arkisto.fi",
-		"nla.gov.au",
-		"ndl.go.jp",
-		"snu.ac.kr",
-		"natlib.govt.nz",
-		// Less common TLDs (.io, .dev, .app, .info, .museum)
-		"pkg.dev",
-		"fonts.google.com",
-		"crates.io",
-		"httpbin.org",
-		"lobste.rs",
-		"arxiv.org",
-		"jstor.org",
-		"archive.org",
-		"gutenberg.org",
-		"openlibrary.org",
-		// Regional sites
-		"rtve.es",
-		"yle.fi",
-		"dr.dk",
-		"nrk.no",
-		"svt.se",
-		"rtp.pt",
-		"rte.ie",
-		"srf.ch",
-		"orf.at",
-		"vrt.be",
-	].into_iter().map(String::from).collect()
+/// Same format as the default: domain,category with header row.
+pub fn load_query_domains_file(path: &str) -> Result<BTreeMap<String, Vec<String>>> {
+	let content = std::fs::read_to_string(path)
+		.map_err(|e| anyhow!("failed to read query domains file '{}': {}", path, e))?;
+	let categories = parse_query_domains_csv(&content);
+	if categories.is_empty() {
+		return Err(anyhow!("no valid domains found in '{}'", path));
+	}
+	Ok(categories)
 }
 
 /// Return a list of domains guaranteed not to exist.
@@ -100,107 +67,6 @@ pub fn default_nxdomain_domains() -> Vec<String> {
 	].into_iter().map(String::from).collect()
 }
 
-/// Return a list of domains spanning many different TLDs.
-///
-/// One real domain per TLD for measuring uncached resolution across
-/// diverse TLD infrastructure.
-pub fn default_tld_domains() -> Vec<String> {
-	vec![
-		// Generic TLDs
-		"icann.org",        // .org
-		"iana.org",         // .org (different authority path)
-		"ietf.org",         // .org (standards body)
-		"example.net",      // .net
-		"verisign.com",     // .com
-		// Tech TLDs
-		"pkg.dev",          // .dev
-		"web.app",          // .app
-		"dart.dev",         // .dev
-		// Government / education
-		"nist.gov",         // .gov
-		"loc.gov",          // .gov
-		"mit.edu",          // .edu
-		// European ccTLDs
-		"ox.ac.uk",         // .uk
-		"tu-berlin.de",     // .de
-		"inria.fr",         // .fr
-		"uva.nl",           // .nl
-		"kth.se",           // .se
-		"lu.ch",            // .ch
-		"tuwien.at",        // .at
-		"kuleuven.be",      // .be
-		"tcd.ie",           // .ie
-		"ulisboa.pt",       // .pt
-		"uio.no",           // .no
-		"oulu.fi",          // .fi
-		"ku.dk",            // .dk
-		// Asia-Pacific ccTLDs
-		"keio.ac.jp",       // .jp
-		"snu.ac.kr",        // .kr
-		"iitb.ac.in",       // .in
-		"uq.edu.au",        // .au
-		"auckland.ac.nz",   // .nz
-		// Americas / Africa ccTLDs
-		"ubc.ca",           // .ca
-		"unam.mx",          // .mx
-		"usp.br",           // .br
-		"uct.ac.za",        // .za
-	].into_iter().map(String::from).collect()
-}
-
-/// Return a list of .com domains for dotcom-specific lookup timing.
-///
-/// The original GRC DNS Benchmark measures how fast resolvers consult
-/// dotcom TLD servers separately from general uncached lookups.
-pub fn default_dotcom_domains() -> Vec<String> {
-	vec![
-		"zillow.com",
-		"wayfair.com",
-		"costco.com",
-		"nordstrom.com",
-		"chewy.com",
-		"zappos.com",
-		"newegg.com",
-		"overstock.com",
-		"kohls.com",
-		"macys.com",
-		"homedepot.com",
-		"lowes.com",
-		"bestbuy.com",
-		"target.com",
-		"walmart.com",
-		"etsy.com",
-		"shopify.com",
-		"squarespace.com",
-		"godaddy.com",
-		"namecheap.com",
-	].into_iter().map(String::from).collect()
-}
-
-/// Return a list of known DNSSEC-signed domains for benchmarking.
-///
-/// When --dnssec is enabled, these domains are benchmarked separately
-/// to measure the overhead of DNSSEC validation.
-pub fn default_dnssec_domains() -> Vec<String> {
-	vec![
-		"cloudflare.com",
-		"isc.org",
-		"ietf.org",
-		"icann.org",
-		"verisign.com",
-		"nist.gov",
-		"nasa.gov",
-		"energy.gov",
-		"treasury.gov",
-		"sec.gov",
-		"irs.gov",
-		"fda.gov",
-		"cdc.gov",
-		"nih.gov",
-		"whitehouse.gov",
-	].into_iter().map(String::from).collect()
-}
-
 /// Read domains from a file, one per line.
 ///
 /// Blank lines and lines starting with '#' are skipped.
@@ -219,29 +85,41 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn test_warm_domains_size() {
-		let warm = default_warm_domains();
-		assert!(!warm.is_empty());
-		assert_eq!(warm.len(), 10);
+	fn test_default_query_domains_loads() {
+		let categories = load_default_query_domains();
+		// Should have at least cached, uncached, tld, dotcom
+		assert!(categories.contains_key("cached"), "missing 'cached' category");
+		assert!(categories.contains_key("uncached"), "missing 'uncached' category");
+		assert!(categories.contains_key("tld"), "missing 'tld' category");
+		assert!(categories.contains_key("dotcom"), "missing 'dotcom' category");
 	}
 
 	#[test]
-	fn test_cold_domains_size() {
-		let cold = default_cold_domains();
-		assert!(!cold.is_empty());
-		assert_eq!(cold.len(), 50);
+	fn test_cached_domains_size() {
+		let categories = load_default_query_domains();
+		let cached = &categories["cached"];
+		assert_eq!(cached.len(), 10);
 	}
 
 	#[test]
-	fn test_cold_domains_are_real() {
-		// Verify none of the cold domains use fake/test prefixes
-		let cold = default_cold_domains();
-		for domain in &cold {
-			assert!(!domain.starts_with("bench-dns-cold-"), "fake domain found: {}", domain);
-			assert!(!domain.starts_with("test-cold-cache-"), "fake domain found: {}", domain);
-			assert!(!domain.starts_with("resolver-perf-test-"), "fake domain found: {}", domain);
-			assert!(!domain.starts_with("zzz-test-domain-"), "fake domain found: {}", domain);
-		}
+	fn test_uncached_domains_size() {
+		let categories = load_default_query_domains();
+		let uncached = &categories["uncached"];
+		assert_eq!(uncached.len(), 50);
+	}
+
+	#[test]
+	fn test_tld_domains_diverse() {
+		let categories = load_default_query_domains();
+		let tld = &categories["tld"];
+		assert!(tld.len() >= 30, "expected at least 30 TLD domains, got {}", tld.len());
+		// Check diverse TLDs
+		let mut tlds: Vec<String> = tld.iter()
+			.filter_map(|d| d.rsplit('.').next().map(String::from))
+			.collect();
+		tlds.sort();
+		tlds.dedup();
+		assert!(tlds.len() >= 15, "expected at least 15 unique TLDs, got {}", tlds.len());
 	}
 
 	#[test]
@@ -253,7 +131,6 @@ mod tests {
 
 	#[test]
 	fn test_nxdomain_domains_are_invalid_tld() {
-		// All NXDOMAIN test domains should use .invalid TLD
 		let nx = default_nxdomain_domains();
 		for domain in &nx {
 			assert!(domain.ends_with(".invalid"), "expected .invalid TLD: {}", domain);
@@ -261,21 +138,17 @@ mod tests {
 	}
 
 	#[test]
-	fn test_tld_domains_size() {
-		let tld = default_tld_domains();
-		assert!(!tld.is_empty());
-		assert!(tld.len() >= 30, "expected at least 30 TLD domains, got {}", tld.len());
+	fn test_parse_csv_handles_comments_and_blanks() {
+		let csv = "domain,category\n\ngoogle.com,cached\n# comment\nexample.com,test\n";
+		let result = parse_query_domains_csv(csv);
+		assert_eq!(result["cached"], vec!["google.com"]);
+		assert_eq!(result["test"], vec!["example.com"]);
 	}
 
 	#[test]
-	fn test_tld_domains_diverse_tlds() {
-		// Check that we have diverse TLDs (not all the same)
-		let tld = default_tld_domains();
-		let mut tlds: Vec<String> = tld.iter()
-			.filter_map(|d| d.rsplit('.').next().map(String::from))
-			.collect();
-		tlds.sort();
-		tlds.dedup();
-		assert!(tlds.len() >= 15, "expected at least 15 unique TLDs, got {}", tlds.len());
+	fn test_dnssec_category_present() {
+		let categories = load_default_query_domains();
+		assert!(categories.contains_key("dnssec"), "missing 'dnssec' category");
+		assert!(categories["dnssec"].len() >= 10, "expected at least 10 DNSSEC domains");
 	}
 }

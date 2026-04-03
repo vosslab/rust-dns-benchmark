@@ -125,18 +125,40 @@ async fn run() -> anyhow::Result<()> {
 		resolvers.extend(sys);
 	}
 
+	// Deduplicate all resolvers by IP address, keeping first occurrence
+	let mut seen_ips = std::collections::HashSet::new();
+	resolvers.retain(|r| seen_ips.insert(r.addr.ip()));
+
 	// Bail early if no resolvers to test
 	if resolvers.is_empty() {
 		anyhow::bail!("No resolvers to test. Provide resolvers via -r, -f, or system defaults.");
 	}
 
-	// Load domain lists from built-in defaults
-	let warm_domains = domains::default_warm_domains();
-	let cold_domains = domains::default_cold_domains();
+	// Load query domain categories (from file or built-in defaults)
+	let mut categories = match &cli.query_domains {
+		Some(path) => domains::load_query_domains_file(path)?,
+		None => domains::load_default_query_domains(),
+	};
+
+	// Only include DNSSEC category when --dnssec is enabled
+	if !cli.dnssec {
+		categories.remove("dnssec");
+	}
+
+	// Load NXDOMAIN test domains (used for characterization, not benchmarking)
 	let nxdomain_domains = domains::default_nxdomain_domains();
-	let tld_domains = domains::default_tld_domains();
-	let dotcom_domains = domains::default_dotcom_domains();
-	let dnssec_domains = domains::default_dnssec_domains();
+
+	// Parse sort mode and validate against loaded categories
+	let sort_mode = stats::parse_sort_mode(&cli.sort);
+	if let stats::SortMode::Category(ref name) = sort_mode {
+		if !categories.contains_key(name) {
+			let valid: Vec<&str> = categories.keys().map(|s| s.as_str()).collect();
+			anyhow::bail!(
+				"Unknown sort category '{}'. Valid categories: score, name, {}",
+				name, valid.join(", ")
+			);
+		}
+	}
 
 	// Auto-enable discovery when resolver list is large (>20)
 	// Scan and exhaustive modes always force discovery on
@@ -158,8 +180,7 @@ async fn run() -> anyhow::Result<()> {
 		discover,
 		top_n: DEFAULT_TOP_N,
 		max_resolver_ms: DEFAULT_MAX_RESOLVER_MS,
-		sort_mode: cli.sort,
-		query_dnssec_domains: cli.dnssec,
+		sort_mode,
 		telemetry: telemetry::TelemetryLog::new(true),
 	};
 
@@ -172,11 +193,13 @@ async fn run() -> anyhow::Result<()> {
 	config.telemetry.log_pipeline("loaded", initial_count);
 
 	// Print configuration summary
-	output::print_config_summary(
-		&resolvers, warm_domains.len(), cold_domains.len(),
-		tld_domains.len(), dotcom_domains.len(),
-		dnssec_domains.len(), &config,
-	);
+	output::print_config_summary(&resolvers, &categories, &config);
+
+	// Early exit if --no-test was requested
+	if cli.no_test {
+		println!("--no-test: exiting without running benchmark.");
+		return Ok(());
+	}
 
 	// Build DoH client pool for any DoH resolvers
 	let doh_clients = bench::build_doh_client_pool(&resolvers);
@@ -185,7 +208,7 @@ async fn run() -> anyhow::Result<()> {
 	// This avoids wasting time characterizing resolvers that will be dropped
 	if config.discover {
 		resolvers = bench::run_discovery(
-			&resolvers, &warm_domains, &config, &doh_clients,
+			&resolvers, &categories, &config, &doh_clients,
 		).await?;
 		println!();
 	}
@@ -203,8 +226,7 @@ async fn run() -> anyhow::Result<()> {
 	// Run benchmark
 	println!("Running benchmark...");
 	let mut results = bench::run_benchmark(
-		&resolvers, &warm_domains, &cold_domains, &tld_domains,
-		&dotcom_domains, &dnssec_domains, &config, &doh_clients,
+		&resolvers, &categories, &config, &doh_clients,
 	).await?;
 
 	// Filter out resolvers with <50% success rate (too noisy to report)
@@ -219,14 +241,22 @@ async fn run() -> anyhow::Result<()> {
 	}
 
 	// Filter out resolvers slower than the max latency threshold
-	let before_count = results.len();
-	results.retain(|r| r.stats.warm.p50_ms <= config.max_resolver_ms);
-	let filtered_count = before_count - results.len();
-	if filtered_count > 0 {
-		println!(
-			"Filtered {} resolver(s) with warm p50 > {} ms",
-			filtered_count, config.max_resolver_ms as u64,
-		);
+	// Use first category p50 as proxy for the warm/cached latency check
+	let first_cat = categories.keys().next().cloned();
+	if let Some(ref cat_name) = first_cat {
+		let before_count = results.len();
+		results.retain(|r| {
+			r.stats.categories.get(cat_name)
+				.map(|s| s.p50_ms <= config.max_resolver_ms)
+				.unwrap_or(true)
+		});
+		let filtered_count = before_count - results.len();
+		if filtered_count > 0 {
+			println!(
+				"Filtered {} resolver(s) with {} p50 > {} ms",
+				filtered_count, cat_name, config.max_resolver_ms as u64,
+			);
+		}
 	}
 
 	// Pin system resolvers to top of results
@@ -245,7 +275,12 @@ async fn run() -> anyhow::Result<()> {
 
 	// Log final results to telemetry
 	for r in &results {
-		config.telemetry.log_result(r.rank, &r.stats.addr, &r.stats.label, r.stats.warm.score, r.stats.warm.p50_ms);
+		// Use first category for telemetry score/p50
+		let (score, p50) = first_cat.as_ref()
+			.and_then(|cat| r.stats.categories.get(cat))
+			.map(|s| (s.score, s.p50_ms))
+			.unwrap_or((r.stats.overall_score, 0.0));
+		config.telemetry.log_result(r.rank, &r.stats.addr, &r.stats.label, score, p50);
 	}
 
 	// Print pipeline summary
@@ -256,12 +291,12 @@ async fn run() -> anyhow::Result<()> {
 	);
 
 	// Print results table and conclusions
-	output::print_results_table(&results, true, true, config.query_dnssec_domains);
+	output::print_results_table(&results);
 	output::print_conclusions(&results);
 
 	// Write CSV if requested
 	if let Some(path) = &cli.output {
-		output::write_csv(path, &results, true, true, config.query_dnssec_domains)?;
+		output::write_csv(path, &results)?;
 	}
 
 	// Save resolver list if requested

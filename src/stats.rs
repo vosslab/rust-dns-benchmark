@@ -1,24 +1,27 @@
-use clap::ValueEnum;
+use std::collections::BTreeMap;
 
 /// Sort mode for ranking resolvers
-#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+#[derive(Debug, Clone, Default)]
 pub enum SortMode {
 	/// Sort by overall composite score (default)
 	#[default]
 	Score,
-	/// Sort by warm (cached) p50 latency
-	Warm,
-	/// Sort by cold (uncached) p50 latency
-	Cold,
-	/// Sort by TLD p50 latency
-	Tld,
-	/// Sort by dotcom p50 latency
-	Dotcom,
+	/// Sort by a specific category's p50 latency (e.g. "cached", "tld")
+	Category(String),
 	/// Sort alphabetically by resolver name
 	Name,
 }
 
-/// Statistics for a set of queries (warm, cold, or tld)
+/// Parse a sort mode string, returning Score, Name, or Category(name).
+pub fn parse_sort_mode(s: &str) -> SortMode {
+	match s {
+		"score" => SortMode::Score,
+		"name" => SortMode::Name,
+		other => SortMode::Category(other.to_string()),
+	}
+}
+
+/// Statistics for a set of queries (e.g. cached, uncached, tld, dotcom)
 #[derive(Debug, Clone, Default)]
 pub struct SetStats {
 	pub p50_ms: f64,
@@ -31,18 +34,15 @@ pub struct SetStats {
 	pub score: f64,
 }
 
-/// Full resolver statistics with warm, cold, and TLD sets
+/// Full resolver statistics with dynamic category sets
 #[derive(Debug, Clone)]
 pub struct ResolverStats {
 	pub label: String,
 	pub addr: String,
 	/// Transport protocol label ("UDP", "DoT", "DoH")
 	pub transport: String,
-	pub warm: SetStats,
-	pub cold: SetStats,
-	pub tld: Option<SetStats>,
-	pub dotcom: Option<SetStats>,
-	pub dnssec_bench: Option<SetStats>,
+	/// Per-category statistics, keyed by category name (e.g. "cached", "tld")
+	pub categories: BTreeMap<String, SetStats>,
 	pub overall_score: f64,
 	pub success_rate: f64,
 	pub intercepts_nxdomain: bool,
@@ -240,7 +240,7 @@ pub fn detect_ties(resolvers: &mut [ScoredResolver], uncertainties: &[f64]) {
 /// Rank resolvers by the chosen sort mode, ascending.
 ///
 /// Lower scores/latencies are better for all numeric modes.
-pub fn rank_resolvers(mut resolvers: Vec<ResolverStats>, sort_mode: SortMode) -> Vec<ScoredResolver> {
+pub fn rank_resolvers(mut resolvers: Vec<ResolverStats>, sort_mode: &SortMode) -> Vec<ScoredResolver> {
 	let cmp_f64 = |a: f64, b: f64| -> std::cmp::Ordering {
 		a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
 	};
@@ -248,24 +248,11 @@ pub fn rank_resolvers(mut resolvers: Vec<ResolverStats>, sort_mode: SortMode) ->
 		SortMode::Score => {
 			resolvers.sort_by(|a, b| cmp_f64(a.overall_score, b.overall_score));
 		}
-		SortMode::Warm => {
-			resolvers.sort_by(|a, b| cmp_f64(a.warm.p50_ms, b.warm.p50_ms));
-		}
-		SortMode::Cold => {
-			resolvers.sort_by(|a, b| cmp_f64(a.cold.p50_ms, b.cold.p50_ms));
-		}
-		SortMode::Tld => {
-			// Resolvers without TLD data sort to the end
+		SortMode::Category(name) => {
+			// Sort by the named category's p50; resolvers without it sort to end
 			resolvers.sort_by(|a, b| {
-				let a_val = a.tld.as_ref().map(|t| t.p50_ms).unwrap_or(f64::MAX);
-				let b_val = b.tld.as_ref().map(|t| t.p50_ms).unwrap_or(f64::MAX);
-				cmp_f64(a_val, b_val)
-			});
-		}
-		SortMode::Dotcom => {
-			resolvers.sort_by(|a, b| {
-				let a_val = a.dotcom.as_ref().map(|t| t.p50_ms).unwrap_or(f64::MAX);
-				let b_val = b.dotcom.as_ref().map(|t| t.p50_ms).unwrap_or(f64::MAX);
+				let a_val = a.categories.get(name).map(|s| s.p50_ms).unwrap_or(f64::MAX);
+				let b_val = b.categories.get(name).map(|s| s.p50_ms).unwrap_or(f64::MAX);
 				cmp_f64(a_val, b_val)
 			});
 		}
@@ -360,62 +347,31 @@ mod tests {
 		assert!((score - 535.0).abs() < 0.01);
 	}
 
+	/// Helper to build a minimal ResolverStats for testing
+	fn make_test_stats(label: &str, overall_score: f64, success_rate: f64) -> ResolverStats {
+		ResolverStats {
+			label: label.to_string(),
+			addr: "0.0.0.0".to_string(),
+			transport: "UDP".to_string(),
+			categories: BTreeMap::new(),
+			overall_score,
+			success_rate,
+			intercepts_nxdomain: false,
+			is_system: false,
+			ptr_name: None,
+			rebinding_protection: None,
+			validates_dnssec: None,
+		}
+	}
+
 	#[test]
 	fn test_ranking_order() {
 		let resolvers = vec![
-			ResolverStats {
-				label: "slow".to_string(),
-				addr: "0.0.0.0".to_string(),
-				transport: "UDP".to_string(),
-				warm: SetStats::default(),
-				cold: SetStats::default(),
-				tld: None,
-				dotcom: None,
-				dnssec_bench: None,
-				overall_score: 100.0,
-				success_rate: 95.0,
-				intercepts_nxdomain: false,
-				is_system: false,
-				ptr_name: None,
-				rebinding_protection: None,
-				validates_dnssec: None,
-			},
-			ResolverStats {
-				label: "fast".to_string(),
-				addr: "0.0.0.0".to_string(),
-				transport: "UDP".to_string(),
-				warm: SetStats::default(),
-				cold: SetStats::default(),
-				tld: None,
-				dotcom: None,
-				dnssec_bench: None,
-				overall_score: 10.0,
-				success_rate: 99.0,
-				intercepts_nxdomain: false,
-				is_system: false,
-				ptr_name: None,
-				rebinding_protection: None,
-				validates_dnssec: None,
-			},
-			ResolverStats {
-				label: "medium".to_string(),
-				addr: "0.0.0.0".to_string(),
-				transport: "UDP".to_string(),
-				warm: SetStats::default(),
-				cold: SetStats::default(),
-				tld: None,
-				dotcom: None,
-				dnssec_bench: None,
-				overall_score: 50.0,
-				success_rate: 97.0,
-				intercepts_nxdomain: false,
-				is_system: false,
-				ptr_name: None,
-				rebinding_protection: None,
-				validates_dnssec: None,
-			},
+			make_test_stats("slow", 100.0, 95.0),
+			make_test_stats("fast", 10.0, 99.0),
+			make_test_stats("medium", 50.0, 97.0),
 		];
-		let ranked = rank_resolvers(resolvers, SortMode::Score);
+		let ranked = rank_resolvers(resolvers, &SortMode::Score);
 		assert_eq!(ranked[0].rank, 1);
 		assert_eq!(ranked[0].stats.label, "fast");
 		assert_eq!(ranked[1].rank, 2);
@@ -451,67 +407,19 @@ mod tests {
 		let mut resolvers = vec![
 			ScoredResolver {
 				rank: 1,
-				stats: ResolverStats {
-					label: "a".to_string(),
-					addr: "0.0.0.0".to_string(),
-					transport: "UDP".to_string(),
-					warm: SetStats::default(),
-					cold: SetStats::default(),
-					tld: None,
-					dotcom: None,
-					dnssec_bench: None,
-					overall_score: 10.0,
-					success_rate: 99.0,
-					intercepts_nxdomain: false,
-					is_system: false,
-					ptr_name: None,
-					rebinding_protection: None,
-					validates_dnssec: None,
-				},
+				stats: make_test_stats("a", 10.0, 99.0),
 				is_system: false,
 				tie_group: None,
 			},
 			ScoredResolver {
 				rank: 2,
-				stats: ResolverStats {
-					label: "b".to_string(),
-					addr: "0.0.0.0".to_string(),
-					transport: "UDP".to_string(),
-					warm: SetStats::default(),
-					cold: SetStats::default(),
-					tld: None,
-					dotcom: None,
-					dnssec_bench: None,
-					overall_score: 11.0,
-					success_rate: 98.0,
-					intercepts_nxdomain: false,
-					is_system: false,
-					ptr_name: None,
-					rebinding_protection: None,
-					validates_dnssec: None,
-				},
+				stats: make_test_stats("b", 11.0, 98.0),
 				is_system: false,
 				tie_group: None,
 			},
 			ScoredResolver {
 				rank: 3,
-				stats: ResolverStats {
-					label: "c".to_string(),
-					addr: "0.0.0.0".to_string(),
-					transport: "UDP".to_string(),
-					warm: SetStats::default(),
-					cold: SetStats::default(),
-					tld: None,
-					dotcom: None,
-					dnssec_bench: None,
-					overall_score: 50.0,
-					success_rate: 95.0,
-					intercepts_nxdomain: false,
-					is_system: false,
-					ptr_name: None,
-					rebinding_protection: None,
-					validates_dnssec: None,
-				},
+				stats: make_test_stats("c", 50.0, 95.0),
 				is_system: false,
 				tie_group: None,
 			},
@@ -532,45 +440,13 @@ mod tests {
 		let mut resolvers = vec![
 			ScoredResolver {
 				rank: 1,
-				stats: ResolverStats {
-					label: "a".to_string(),
-					addr: "0.0.0.0".to_string(),
-					transport: "UDP".to_string(),
-					warm: SetStats::default(),
-					cold: SetStats::default(),
-					tld: None,
-					dotcom: None,
-					dnssec_bench: None,
-					overall_score: 10.0,
-					success_rate: 99.0,
-					intercepts_nxdomain: false,
-					is_system: false,
-					ptr_name: None,
-					rebinding_protection: None,
-					validates_dnssec: None,
-				},
+				stats: make_test_stats("a", 10.0, 99.0),
 				is_system: false,
 				tie_group: None,
 			},
 			ScoredResolver {
 				rank: 2,
-				stats: ResolverStats {
-					label: "b".to_string(),
-					addr: "0.0.0.0".to_string(),
-					transport: "UDP".to_string(),
-					warm: SetStats::default(),
-					cold: SetStats::default(),
-					tld: None,
-					dotcom: None,
-					dnssec_bench: None,
-					overall_score: 100.0,
-					success_rate: 95.0,
-					intercepts_nxdomain: false,
-					is_system: false,
-					ptr_name: None,
-					rebinding_protection: None,
-					validates_dnssec: None,
-				},
+				stats: make_test_stats("b", 100.0, 95.0),
 				is_system: false,
 				tie_group: None,
 			},
@@ -581,5 +457,19 @@ mod tests {
 
 		assert_eq!(resolvers[0].tie_group, None);
 		assert_eq!(resolvers[1].tie_group, None);
+	}
+
+	#[test]
+	fn test_sort_by_category() {
+		let mut stats_a = make_test_stats("a", 10.0, 99.0);
+		stats_a.categories.insert("cached".to_string(), SetStats { p50_ms: 50.0, ..Default::default() });
+		let mut stats_b = make_test_stats("b", 20.0, 99.0);
+		stats_b.categories.insert("cached".to_string(), SetStats { p50_ms: 10.0, ..Default::default() });
+
+		let resolvers = vec![stats_a, stats_b];
+		let ranked = rank_resolvers(resolvers, &SortMode::Category("cached".to_string()));
+		// b has lower cached p50, should rank first
+		assert_eq!(ranked[0].stats.label, "b");
+		assert_eq!(ranked[1].stats.label, "a");
 	}
 }

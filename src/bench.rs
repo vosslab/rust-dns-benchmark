@@ -572,16 +572,23 @@ pub async fn run_characterization(
 /// Phase 2: parallel warm-only benchmark on survivors, keep top N by p50.
 pub async fn run_discovery(
 	resolvers: &[ResolverConfig],
-	warm_domains: &[String],
+	categories: &std::collections::BTreeMap<String, Vec<String>>,
 	config: &BenchmarkConfig,
 	doh_clients: &DohClientPool,
 ) -> Result<Vec<ResolverConfig>> {
 	let top_n = config.top_n;
 	println!("Discovery mode: screening {} resolvers...", resolvers.len());
 
+	// Pick discovery domains from the first category with enough entries
+	let discovery_domains: &[String] = categories.values()
+		.find(|domains| domains.len() >= 5)
+		.or_else(|| categories.values().next())
+		.map(|v| v.as_slice())
+		.unwrap_or(&[]);
+
 	// Phase 1: fast parallel reachability screen (1 query, 500ms timeout)
 	let screen_timeout = Duration::from_millis(500);
-	let screen_domain = warm_domains.first()
+	let screen_domain = discovery_domains.first()
 		.map(|s| s.as_str())
 		.unwrap_or("google.com");
 	let semaphore = std::sync::Arc::new(Semaphore::new(config.max_inflight));
@@ -641,7 +648,7 @@ pub async fn run_discovery(
 	// Build all tasks and run concurrently
 	let mut bench_handles = Vec::new();
 	for resolver in &survivors {
-		for domain in warm_domains {
+		for domain in discovery_domains {
 			let sem = semaphore.clone();
 			let resolver_clone = resolver.clone();
 			let timeout = config.timeout;
@@ -712,11 +719,7 @@ pub async fn run_discovery(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_benchmark(
 	resolvers: &[ResolverConfig],
-	warm_domains: &[String],
-	cold_domains: &[String],
-	tld_domains: &[String],
-	dotcom_domains: &[String],
-	dnssec_domains: &[String],
+	categories: &std::collections::BTreeMap<String, Vec<String>>,
 	config: &BenchmarkConfig,
 	doh_clients: &DohClientPool,
 ) -> Result<Vec<ScoredResolver>> {
@@ -727,60 +730,17 @@ pub async fn run_benchmark(
 		vec![QueryType::A]
 	};
 
-	// Build the list of all query tasks
+	// Build the list of all query tasks from all categories
 	let mut tasks: Vec<QueryTask> = Vec::new();
 	for resolver in resolvers {
-		for domain in warm_domains {
-			for &qt in &query_types {
-				tasks.push(QueryTask {
-					resolver: resolver.clone(),
-					domain: domain.clone(),
-					query_type: qt,
-					set_name: "warm".to_string(),
-				});
-			}
-		}
-		for domain in cold_domains {
-			for &qt in &query_types {
-				tasks.push(QueryTask {
-					resolver: resolver.clone(),
-					domain: domain.clone(),
-					query_type: qt,
-					set_name: "cold".to_string(),
-				});
-			}
-		}
-		// TLD domains (only if enabled)
-		for domain in tld_domains {
-			for &qt in &query_types {
-				tasks.push(QueryTask {
-					resolver: resolver.clone(),
-					domain: domain.clone(),
-					query_type: qt,
-					set_name: "tld".to_string(),
-				});
-			}
-		}
-		// Dotcom domains
-		for domain in dotcom_domains {
-			for &qt in &query_types {
-				tasks.push(QueryTask {
-					resolver: resolver.clone(),
-					domain: domain.clone(),
-					query_type: qt,
-					set_name: "dotcom".to_string(),
-				});
-			}
-		}
-		// DNSSEC-signed domains (only when DNSSEC is enabled)
-		if config.query_dnssec_domains {
-			for domain in dnssec_domains {
+		for (category_name, domains) in categories {
+			for domain in domains {
 				for &qt in &query_types {
 					tasks.push(QueryTask {
 						resolver: resolver.clone(),
 						domain: domain.clone(),
 						query_type: qt,
-						set_name: "dnssec".to_string(),
+						set_name: category_name.clone(),
 					});
 				}
 			}
@@ -969,48 +929,17 @@ pub async fn run_benchmark(
 			.or_default();
 		let latency_ms = result.latency.as_secs_f64() * 1000.0;
 
-		match task.set_name.as_str() {
-			"warm" => {
-				if result.success {
-					entry.warm_latencies.push(latency_ms);
-				}
-				entry.warm_total += 1;
-				if result.success { entry.warm_success += 1; }
-				if result.timeout { entry.warm_timeout += 1; }
-			}
-			"cold" => {
-				if result.success {
-					entry.cold_latencies.push(latency_ms);
-				}
-				entry.cold_total += 1;
-				if result.success { entry.cold_success += 1; }
-				if result.timeout { entry.cold_timeout += 1; }
-			}
-			"tld" => {
-				if result.success {
-					entry.tld_latencies.push(latency_ms);
-				}
-				entry.tld_total += 1;
-				if result.success { entry.tld_success += 1; }
-				if result.timeout { entry.tld_timeout += 1; }
-			}
-			"dotcom" => {
-				if result.success {
-					entry.dotcom_latencies.push(latency_ms);
-				}
-				entry.dotcom_total += 1;
-				if result.success { entry.dotcom_success += 1; }
-				if result.timeout { entry.dotcom_timeout += 1; }
-			}
-			"dnssec" => {
-				if result.success {
-					entry.dnssec_latencies.push(latency_ms);
-				}
-				entry.dnssec_total += 1;
-				if result.success { entry.dnssec_success += 1; }
-				if result.timeout { entry.dnssec_timeout += 1; }
-			}
-			_ => {}
+		// Aggregate into the appropriate category bucket
+		let cat = entry.categories
+			.entry(task.set_name.clone())
+			.or_default();
+		if result.success {
+			cat.latencies.push(latency_ms);
+			cat.success += 1;
+		}
+		cat.total += 1;
+		if result.timeout {
+			cat.timeout += 1;
 		}
 	}
 
@@ -1043,55 +972,30 @@ pub async fn run_benchmark(
 	let mut all_latencies_per_resolver: Vec<Vec<f64>> = Vec::new();
 
 	for (resolver_ip, agg) in &resolver_data {
-		let warm_stats = compute_set_stats(
-			&agg.warm_latencies, agg.warm_success,
-			agg.warm_timeout, agg.warm_total, timeout_penalty_ms,
-		);
-		let cold_stats = compute_set_stats(
-			&agg.cold_latencies, agg.cold_success,
-			agg.cold_timeout, agg.cold_total, timeout_penalty_ms,
-		);
+		// Compute per-category stats
+		let mut cat_stats: std::collections::BTreeMap<String, crate::stats::SetStats> = std::collections::BTreeMap::new();
+		for (cat_name, cat_agg) in &agg.categories {
+			let stats = compute_set_stats(
+				&cat_agg.latencies, cat_agg.success,
+				cat_agg.timeout, cat_agg.total, timeout_penalty_ms,
+			);
+			cat_stats.insert(cat_name.clone(), stats);
+		}
 
-		// TLD stats (optional)
-		let tld_stats = if agg.tld_total > 0 {
-			Some(compute_set_stats(
-				&agg.tld_latencies, agg.tld_success,
-				agg.tld_timeout, agg.tld_total, timeout_penalty_ms,
-			))
+		// Overall score: average of all categories that have data
+		let scored_categories: Vec<f64> = cat_stats.values()
+			.filter(|s| s.total_count > 0)
+			.map(|s| s.score)
+			.collect();
+		let overall_score = if scored_categories.is_empty() {
+			f64::INFINITY
 		} else {
-			None
+			scored_categories.iter().sum::<f64>() / scored_categories.len() as f64
 		};
 
-		// Dotcom stats (optional)
-		let dotcom_stats = if agg.dotcom_total > 0 {
-			Some(compute_set_stats(
-				&agg.dotcom_latencies, agg.dotcom_success,
-				agg.dotcom_timeout, agg.dotcom_total, timeout_penalty_ms,
-			))
-		} else {
-			None
-		};
-
-		// DNSSEC benchmark stats (optional)
-		let dnssec_bench_stats = if config.query_dnssec_domains && agg.dnssec_total > 0 {
-			Some(compute_set_stats(
-				&agg.dnssec_latencies, agg.dnssec_success,
-				agg.dnssec_timeout, agg.dnssec_total, timeout_penalty_ms,
-			))
-		} else {
-			None
-		};
-
-		// Overall score: average of warm, cold, and dotcom (if present)
-		let overall_score = if let Some(ref dc) = dotcom_stats {
-			(warm_stats.score + cold_stats.score + dc.score) / 3.0
-		} else {
-			(warm_stats.score + cold_stats.score) / 2.0
-		};
-		let total = agg.warm_total + agg.cold_total + agg.tld_total
-			+ agg.dotcom_total + agg.dnssec_total;
-		let total_success = agg.warm_success + agg.cold_success + agg.tld_success
-			+ agg.dotcom_success + agg.dnssec_success;
+		// Total success rate across all categories
+		let total: usize = agg.categories.values().map(|c| c.total).sum();
+		let total_success: usize = agg.categories.values().map(|c| c.success).sum();
 		let success_rate = if total > 0 {
 			(total_success as f64 / total as f64) * 100.0
 		} else {
@@ -1106,8 +1010,10 @@ pub async fn run_benchmark(
 			.unwrap_or(false);
 
 		// Combine all latencies for uncertainty computation
-		let mut combined = agg.warm_latencies.clone();
-		combined.extend(&agg.cold_latencies);
+		let mut combined: Vec<f64> = Vec::new();
+		for cat_agg in agg.categories.values() {
+			combined.extend(&cat_agg.latencies);
+		}
 		all_latencies_per_resolver.push(combined);
 
 		let is_system = system_map.get(resolver_ip)
@@ -1132,11 +1038,7 @@ pub async fn run_benchmark(
 			label,
 			addr: resolver_ip.clone(),
 			transport: transport_label,
-			warm: warm_stats,
-			cold: cold_stats,
-			tld: tld_stats,
-			dotcom: dotcom_stats,
-			dnssec_bench: dnssec_bench_stats,
+			categories: cat_stats,
 			overall_score,
 			success_rate,
 			intercepts_nxdomain: intercepts,
@@ -1147,7 +1049,7 @@ pub async fn run_benchmark(
 		});
 	}
 
-	let mut ranked = rank_resolvers(stats_list, config.sort_mode);
+	let mut ranked = rank_resolvers(stats_list, &config.sort_mode);
 
 	// Build label-to-uncertainty map for O(1) lookup
 	let uncertainty_map: HashMap<String, f64> = resolver_data.iter()
@@ -1169,27 +1071,17 @@ pub async fn run_benchmark(
 	Ok(ranked)
 }
 
+/// Per-category aggregation of query results
+#[derive(Default)]
+struct CategoryAgg {
+	latencies: Vec<f64>,
+	success: usize,
+	total: usize,
+	timeout: usize,
+}
+
 /// Intermediate aggregation of query results for a single resolver
 #[derive(Default)]
 struct ResolverAggregation {
-	warm_latencies: Vec<f64>,
-	cold_latencies: Vec<f64>,
-	tld_latencies: Vec<f64>,
-	dotcom_latencies: Vec<f64>,
-	dnssec_latencies: Vec<f64>,
-	warm_success: usize,
-	cold_success: usize,
-	tld_success: usize,
-	dotcom_success: usize,
-	dnssec_success: usize,
-	warm_total: usize,
-	cold_total: usize,
-	tld_total: usize,
-	dotcom_total: usize,
-	dnssec_total: usize,
-	warm_timeout: usize,
-	cold_timeout: usize,
-	tld_timeout: usize,
-	dotcom_timeout: usize,
-	dnssec_timeout: usize,
+	categories: std::collections::BTreeMap<String, CategoryAgg>,
 }

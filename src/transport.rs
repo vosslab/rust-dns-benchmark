@@ -108,8 +108,6 @@ pub struct BenchmarkConfig {
 	pub max_resolver_ms: f64,
 	/// Sort mode for ranking results
 	pub sort_mode: SortMode,
-	/// Enable DNSSEC-signed domain benchmarking (only when dnssec is true)
-	pub query_dnssec_domains: bool,
 	/// Telemetry logger for JSONL debug output
 	pub telemetry: crate::telemetry::TelemetryLog,
 }

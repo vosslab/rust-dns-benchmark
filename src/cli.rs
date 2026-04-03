@@ -1,7 +1,5 @@
 use clap::Parser;
 
-use crate::stats::SortMode;
-
 /// DNS resolver benchmark tool
 #[derive(Parser, Debug)]
 #[command(name = "dns-benchmark")]
@@ -43,9 +41,9 @@ pub struct Cli {
 	#[arg(long = "no-system-resolvers")]
 	pub no_system_resolvers: bool,
 
-	/// Sort order for results
-	#[arg(long = "sort", default_value = "score", value_enum)]
-	pub sort: SortMode,
+	/// Sort order for results (score, name, or any category name like cached, tld)
+	#[arg(long = "sort", default_value = "score")]
+	pub sort: String,
 
 	/// Massive-scale scan: load ~11K public resolvers, discover survivors, benchmark with 30 rounds
 	#[arg(long = "scan")]
@@ -54,4 +52,12 @@ pub struct Cli {
 	/// Exhaustive test: load ALL resolver lists (built-in + US scan + global), discover survivors, benchmark thoroughly
 	#[arg(long = "exhaustive")]
 	pub exhaustive: bool,
+
+	/// Custom query domains CSV file (domain,category format)
+	#[arg(short = 'p', long = "query-domains")]
+	pub query_domains: Option<String>,
+
+	/// Print config summary and exit without running benchmark
+	#[arg(long = "no-test")]
+	pub no_test: bool,
 }
