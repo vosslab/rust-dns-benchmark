@@ -4,6 +4,16 @@ use std::time::Duration;
 
 use crate::stats::SortMode;
 
+// Hardcoded benchmark defaults (CLI minimalism: not user-configurable)
+pub const DEFAULT_TIMEOUT_MS: u64 = 2000;
+pub const DEFAULT_CONCURRENCY: usize = 64;
+pub const DEFAULT_SPACING_MS: u64 = 25;
+pub const DEFAULT_TOP_N: usize = 50;
+pub const DEFAULT_MAX_RESOLVER_MS: f64 = 1000.0;
+pub const DEFAULT_SIDELINE_MS: f64 = 500.0;
+pub const DEFAULT_CHAR_TIMEOUT_MS: u64 = 50;
+pub const DEFAULT_CHAR_ATTEMPTS: u32 = 10;
+
 /// DNS transport protocol
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsTransport {
@@ -48,6 +58,12 @@ pub struct ResolverConfig {
 	pub rebinding_protection: Option<bool>,
 	/// Whether the resolver validates DNSSEC signatures
 	pub validates_dnssec: Option<bool>,
+	/// ISO 2-letter country code from public-dns.info metadata
+	pub country_code: Option<String>,
+	/// Autonomous system organization name
+	pub as_org: Option<String>,
+	/// Reliability score (0.0-1.0) from public-dns.info
+	pub reliability: Option<f64>,
 }
 
 /// DNS query type
@@ -84,8 +100,6 @@ pub struct BenchmarkConfig {
 	pub seed: Option<u64>,
 	/// Enable DNSSEC (DO bit) on all queries
 	pub dnssec: bool,
-	/// Enable TLD diversity measurement
-	pub query_tld: bool,
 	/// Enable discovery prefilter mode
 	pub discover: bool,
 	/// Number of top resolvers to keep in discovery mode
@@ -94,18 +108,6 @@ pub struct BenchmarkConfig {
 	pub max_resolver_ms: f64,
 	/// Sort mode for ranking results
 	pub sort_mode: SortMode,
-	/// Pin system resolvers to the top of results
-	pub pin_system: bool,
-	/// Enable mid-benchmark sidelining of slow resolvers
-	pub sideline: bool,
-	/// Maximum p50 latency (ms) before a resolver is sidelined mid-benchmark
-	pub sideline_ms: f64,
-	/// Enable dotcom-specific lookup timing
-	pub query_dotcom: bool,
-	/// Characterization timeout in ms (max reply time per attempt)
-	pub char_timeout: Duration,
-	/// Number of characterization attempts per resolver
-	pub char_attempts: u32,
 	/// Enable DNSSEC-signed domain benchmarking (only when dnssec is true)
 	pub query_dnssec_domains: bool,
 	/// Telemetry logger for JSONL debug output

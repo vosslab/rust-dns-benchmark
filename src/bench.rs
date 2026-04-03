@@ -398,9 +398,9 @@ pub async fn run_characterization(
 	let timeout = config.timeout;
 
 	// Phase 0: v2-style reachability pre-check
-	// Give each resolver up to char_attempts chances to reply within char_timeout
-	let char_timeout = config.char_timeout;
-	let char_attempts = config.char_attempts;
+	// Give each resolver up to DEFAULT_CHAR_ATTEMPTS chances to reply within DEFAULT_CHAR_TIMEOUT_MS
+	let char_timeout = Duration::from_millis(crate::transport::DEFAULT_CHAR_TIMEOUT_MS);
+	let char_attempts = crate::transport::DEFAULT_CHAR_ATTEMPTS;
 	println!("Reachability pre-check ({} resolvers, {} attempts, {} ms timeout)...",
 		resolvers.len(), char_attempts, char_timeout.as_millis());
 
@@ -751,29 +751,25 @@ pub async fn run_benchmark(
 			}
 		}
 		// TLD domains (only if enabled)
-		if config.query_tld {
-			for domain in tld_domains {
-				for &qt in &query_types {
-					tasks.push(QueryTask {
-						resolver: resolver.clone(),
-						domain: domain.clone(),
-						query_type: qt,
-						set_name: "tld".to_string(),
-					});
-				}
+		for domain in tld_domains {
+			for &qt in &query_types {
+				tasks.push(QueryTask {
+					resolver: resolver.clone(),
+					domain: domain.clone(),
+					query_type: qt,
+					set_name: "tld".to_string(),
+				});
 			}
 		}
-		// Dotcom domains (only if enabled)
-		if config.query_dotcom {
-			for domain in dotcom_domains {
-				for &qt in &query_types {
-					tasks.push(QueryTask {
-						resolver: resolver.clone(),
-						domain: domain.clone(),
-						query_type: qt,
-						set_name: "dotcom".to_string(),
-					});
-				}
+		// Dotcom domains
+		for domain in dotcom_domains {
+			for &qt in &query_types {
+				tasks.push(QueryTask {
+					resolver: resolver.clone(),
+					domain: domain.clone(),
+					query_type: qt,
+					set_name: "dotcom".to_string(),
+				});
 			}
 		}
 		// DNSSEC-signed domains (only when DNSSEC is enabled)
@@ -919,7 +915,7 @@ pub async fn run_benchmark(
 		config.telemetry.log_round_complete(round + 1, round_total, round_failures);
 
 		// Mid-benchmark sidelining: check for slow/dead resolvers after each round
-		if config.sideline && round < config.rounds - 1 {
+		if round < config.rounds - 1 {
 			let mut per_resolver: HashMap<String, (usize, usize, Vec<f64>)> = HashMap::new();
 			for (task, result) in &all_results {
 				let ip = task.resolver.addr.ip().to_string();
@@ -950,10 +946,10 @@ pub async fn run_benchmark(
 					let mut sorted = latencies.clone();
 					sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
 					let p50 = sorted[sorted.len() / 2];
-					if p50 > config.sideline_ms {
+					if p50 > crate::transport::DEFAULT_SIDELINE_MS {
 						let label = label_map_for_sideline.get(ip)
 							.cloned().unwrap_or_else(|| ip.clone());
-						let reason = format!("p50 {:.0} ms > {} ms threshold", p50, config.sideline_ms as u64);
+						let reason = format!("p50 {:.0} ms > {} ms threshold", p50, crate::transport::DEFAULT_SIDELINE_MS as u64);
 						println!("  Sidelined {} ({}) -- {}", label, ip, reason);
 						config.telemetry.log_sidelined(ip, &reason, round + 1);
 						sidelined.insert(ip.clone());
@@ -1057,7 +1053,7 @@ pub async fn run_benchmark(
 		);
 
 		// TLD stats (optional)
-		let tld_stats = if config.query_tld && agg.tld_total > 0 {
+		let tld_stats = if agg.tld_total > 0 {
 			Some(compute_set_stats(
 				&agg.tld_latencies, agg.tld_success,
 				agg.tld_timeout, agg.tld_total, timeout_penalty_ms,
@@ -1067,7 +1063,7 @@ pub async fn run_benchmark(
 		};
 
 		// Dotcom stats (optional)
-		let dotcom_stats = if config.query_dotcom && agg.dotcom_total > 0 {
+		let dotcom_stats = if agg.dotcom_total > 0 {
 			Some(compute_set_stats(
 				&agg.dotcom_latencies, agg.dotcom_success,
 				agg.dotcom_timeout, agg.dotcom_total, timeout_penalty_ms,

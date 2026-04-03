@@ -57,17 +57,13 @@ pub fn print_config_summary(
 	}
 	println!("Warm domains:   {}", warm_count);
 	println!("Cold domains:   {}", cold_count);
-	if config.query_tld {
-		println!("TLD domains:    {}", tld_count);
-	}
-	if config.query_dotcom {
-		println!("Dotcom domains: {}", dotcom_count);
-	}
+	println!("TLD domains:    {}", tld_count);
+	println!("Dotcom domains: {}", dotcom_count);
 	if config.query_dnssec_domains {
 		println!("DNSSEC domains: {}", dnssec_count);
 	}
-	println!("Char timeout:   {} ms", config.char_timeout.as_millis());
-	println!("Char attempts:  {}", config.char_attempts);
+	println!("Char timeout:   {} ms", crate::transport::DEFAULT_CHAR_TIMEOUT_MS);
+	println!("Char attempts:  {}", crate::transport::DEFAULT_CHAR_ATTEMPTS);
 	println!("Rounds:         {}", config.rounds);
 	println!("Timeout:        {} ms", config.timeout.as_millis());
 	println!("Concurrency:    {}", config.max_inflight);
@@ -88,9 +84,7 @@ pub fn print_config_summary(
 		crate::stats::SortMode::Name => "name",
 	};
 	println!("Sort by:        {}", sort_label);
-	if config.pin_system {
-		println!("Pin system:     yes");
-	}
+	println!("Pin system:     yes");
 	if let Some(seed) = config.seed {
 		println!("Seed:           {}", seed);
 	}

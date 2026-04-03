@@ -15,41 +15,9 @@ pub struct Cli {
 	#[arg(short = 'f', long = "resolver-file")]
 	pub resolver_file: Option<String>,
 
-	/// File containing warm (cached) domains to query
-	#[arg(long = "warm-domains")]
-	pub warm_domains: Option<String>,
-
-	/// File containing cold (uncached) domains to query
-	#[arg(long = "cold-domains")]
-	pub cold_domains: Option<String>,
-
-	/// File containing NXDOMAIN test domains for interception detection
-	#[arg(long = "nxdomain-domains")]
-	pub nxdomain_domains: Option<String>,
-
-	/// File containing TLD-diverse domains to query
-	#[arg(long = "tld-domains")]
-	pub tld_domains: Option<String>,
-
-	/// Disable TLD diversity measurement
-	#[arg(long = "no-tld")]
-	pub no_tld: bool,
-
 	/// Number of benchmark rounds
 	#[arg(short = 'n', long = "rounds", default_value = "3")]
 	pub rounds: u32,
-
-	/// Query timeout in milliseconds
-	#[arg(short = 't', long = "timeout", default_value = "2000")]
-	pub timeout: u64,
-
-	/// Maximum concurrent in-flight queries
-	#[arg(short = 'c', long = "concurrency", default_value = "64")]
-	pub concurrency: usize,
-
-	/// Inter-query spacing in milliseconds
-	#[arg(long = "spacing", default_value = "25")]
-	pub spacing: u64,
 
 	/// Also query AAAA records
 	#[arg(long = "aaaa")]
@@ -58,22 +26,6 @@ pub struct Cli {
 	/// Enable DNSSEC (set DO bit on all queries)
 	#[arg(long = "dnssec")]
 	pub dnssec: bool,
-
-	/// Enable discovery mode to prefilter a large resolver list
-	#[arg(long = "discover")]
-	pub discover: bool,
-
-	/// Number of top resolvers to keep in discovery mode
-	#[arg(long = "top", default_value = "50")]
-	pub top: usize,
-
-	/// Disable auto-discovery (benchmark all resolvers without prefiltering)
-	#[arg(long = "no-discover")]
-	pub no_discover: bool,
-
-	/// Maximum resolver latency in ms; drop resolvers slower than this from results
-	#[arg(long = "max-resolver-ms", default_value = "1000")]
-	pub max_resolver_ms: u64,
 
 	/// Output CSV file path
 	#[arg(short = 'o', long = "output")]
@@ -95,50 +47,6 @@ pub struct Cli {
 	#[arg(long = "sort", default_value = "score", value_enum)]
 	pub sort: SortMode,
 
-	/// Do not pin system resolvers to the top of results (pinned by default)
-	#[arg(long = "no-pin-system")]
-	pub no_pin_system: bool,
-
-	/// Disable mid-benchmark sidelining of slow resolvers
-	#[arg(long = "no-sideline")]
-	pub no_sideline: bool,
-
-	/// Maximum p50 latency (ms) before sidelining a resolver mid-benchmark
-	#[arg(long = "sideline-ms", default_value = "500")]
-	pub sideline_ms: u64,
-
-	/// Exclude built-in IPv6 resolvers
-	#[arg(long = "no-ipv6-resolvers")]
-	pub no_ipv6_resolvers: bool,
-
-	/// Exclude built-in DoH resolvers
-	#[arg(long = "no-doh-resolvers")]
-	pub no_doh_resolvers: bool,
-
-	/// Exclude built-in DoT resolvers
-	#[arg(long = "no-dot-resolvers")]
-	pub no_dot_resolvers: bool,
-
-	/// Disable dotcom-specific lookup timing
-	#[arg(long = "no-dotcom")]
-	pub no_dotcom: bool,
-
-	/// File containing dotcom domains to query
-	#[arg(long = "dotcom-domains")]
-	pub dotcom_domains: Option<String>,
-
-	/// Characterization timeout in milliseconds (max reply time per attempt)
-	#[arg(long = "char-timeout", default_value = "50")]
-	pub char_timeout: u64,
-
-	/// Number of characterization attempts per resolver
-	#[arg(long = "char-attempts", default_value = "10")]
-	pub char_attempts: u32,
-
-	/// File containing DNSSEC-signed domains for benchmarking
-	#[arg(long = "dnssec-domains")]
-	pub dnssec_domains: Option<String>,
-
 	/// Massive-scale scan: load ~11K public resolvers, discover survivors, benchmark with 30 rounds
 	#[arg(long = "scan")]
 	pub scan: bool,
@@ -146,8 +54,4 @@ pub struct Cli {
 	/// Exhaustive test: load ALL resolver lists (built-in + US scan + global), discover survivors, benchmark thoroughly
 	#[arg(long = "exhaustive")]
 	pub exhaustive: bool,
-
-	/// Disable JSONL telemetry log (dns_benchmark.jsonl)
-	#[arg(long = "no-log")]
-	pub no_log: bool,
 }

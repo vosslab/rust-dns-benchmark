@@ -14,7 +14,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use crate::cli::Cli;
-use crate::transport::BenchmarkConfig;
+use crate::transport::{BenchmarkConfig, DEFAULT_TIMEOUT_MS, DEFAULT_CONCURRENCY,
+	DEFAULT_SPACING_MS, DEFAULT_TOP_N, DEFAULT_MAX_RESOLVER_MS};
 
 /// GRC-compatible exit codes for automation and scripting.
 ///
@@ -73,20 +74,29 @@ async fn run() -> anyhow::Result<()> {
 		resolvers.extend(resolver::read_resolver_file(path)?);
 	}
 
-	// Exhaustive mode: load ~63K global public resolvers
+	// Exhaustive mode: download CSV with metadata, fall back to local scan_global.txt
 	if cli.exhaustive {
-		let mut global_list = resolver::scan_global_resolvers();
-		if global_list.is_empty() {
-			// Auto-download fresh nameserver list
-			println!("Downloading global nameserver list from public-dns.info...");
-			let global_path = resolver::download_global_list().await?;
-			global_list = resolver::read_resolver_file(&global_path)?;
+		match resolver::download_exhaustive_csv().await {
+			Ok(csv_resolvers) if !csv_resolvers.is_empty() => {
+				println!("Exhaustive mode: loaded {} resolvers from public-dns.info CSV", csv_resolvers.len());
+				resolvers.extend(csv_resolvers);
+			}
+			Ok(_) | Err(_) => {
+				// Fallback to local scan_global.txt or download plain text list
+				println!("CSV download failed or empty, falling back to local resolver list");
+				let mut global_list = resolver::scan_global_resolvers();
+				if global_list.is_empty() {
+					println!("Downloading global nameserver list from public-dns.info...");
+					let global_path = resolver::download_global_list().await?;
+					global_list = resolver::read_resolver_file(&global_path)?;
+				}
+				if global_list.is_empty() {
+					anyhow::bail!("Global scan list is empty after download. Cannot run --exhaustive mode.");
+				}
+				println!("Exhaustive mode: loading {} global public resolvers from fallback", global_list.len());
+				resolvers.extend(global_list);
+			}
 		}
-		if global_list.is_empty() {
-			anyhow::bail!("Global scan list is empty after download. Cannot run --exhaustive mode.");
-		}
-		println!("Exhaustive mode: loading {} global public resolvers", global_list.len());
-		resolvers.extend(global_list);
 	}
 
 	// Scan mode: load ~11K US public resolvers for massive-scale testing
@@ -102,15 +112,9 @@ async fn run() -> anyhow::Result<()> {
 	// Load built-in resolver lists (always, unless user specified explicit resolvers)
 	if !user_specified {
 		resolvers.extend(resolver::default_resolvers());
-		if !cli.no_ipv6_resolvers {
-			resolvers.extend(resolver::default_ipv6_resolvers());
-		}
-		if !cli.no_doh_resolvers {
-			resolvers.extend(resolver::default_doh_resolvers());
-		}
-		if !cli.no_dot_resolvers {
-			resolvers.extend(resolver::default_dot_resolvers());
-		}
+		resolvers.extend(resolver::default_ipv6_resolvers());
+		resolvers.extend(resolver::default_doh_resolvers());
+		resolvers.extend(resolver::default_dot_resolvers());
 	}
 
 	// System resolvers (included by default, opt out with --no-system-resolvers)
@@ -126,73 +130,42 @@ async fn run() -> anyhow::Result<()> {
 		anyhow::bail!("No resolvers to test. Provide resolvers via -r, -f, or system defaults.");
 	}
 
-	// Collect domains from files or defaults
-	let warm_domains = match &cli.warm_domains {
-		Some(path) => domains::read_domain_file(path)?,
-		None => domains::default_warm_domains(),
-	};
-	let cold_domains = match &cli.cold_domains {
-		Some(path) => domains::read_domain_file(path)?,
-		None => domains::default_cold_domains(),
-	};
-	let nxdomain_domains = match &cli.nxdomain_domains {
-		Some(path) => domains::read_domain_file(path)?,
-		None => domains::default_nxdomain_domains(),
-	};
-	let tld_domains = match &cli.tld_domains {
-		Some(path) => domains::read_domain_file(path)?,
-		None => domains::default_tld_domains(),
-	};
-	let dotcom_domains = match &cli.dotcom_domains {
-		Some(path) => domains::read_domain_file(path)?,
-		None => domains::default_dotcom_domains(),
-	};
-	let dnssec_domains = match &cli.dnssec_domains {
-		Some(path) => domains::read_domain_file(path)?,
-		None => domains::default_dnssec_domains(),
-	};
+	// Load domain lists from built-in defaults
+	let warm_domains = domains::default_warm_domains();
+	let cold_domains = domains::default_cold_domains();
+	let nxdomain_domains = domains::default_nxdomain_domains();
+	let tld_domains = domains::default_tld_domains();
+	let dotcom_domains = domains::default_dotcom_domains();
+	let dnssec_domains = domains::default_dnssec_domains();
 
-	// Build benchmark config
-	let query_tld = !cli.no_tld;
-	// Auto-enable discovery when resolver list is large (>20) unless disabled
+	// Auto-enable discovery when resolver list is large (>20)
 	// Scan and exhaustive modes always force discovery on
 	let discover = if cli.scan || cli.exhaustive {
 		true
-	} else if cli.no_discover {
-		false
 	} else {
-		cli.discover || resolvers.len() > 20
+		resolvers.len() > 20
 	};
 	// Scan/exhaustive modes override rounds to 30 for thorough testing
 	let rounds = if cli.scan || cli.exhaustive { 30 } else { cli.rounds };
-	let query_dotcom = !cli.no_dotcom;
-	let query_dnssec_domains = cli.dnssec;
 	let config = BenchmarkConfig {
 		rounds,
-		timeout: Duration::from_millis(cli.timeout),
-		max_inflight: cli.concurrency,
-		inter_query_spacing: Duration::from_millis(cli.spacing),
+		timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
+		max_inflight: DEFAULT_CONCURRENCY,
+		inter_query_spacing: Duration::from_millis(DEFAULT_SPACING_MS),
 		query_aaaa: cli.aaaa,
 		seed: cli.seed,
 		dnssec: cli.dnssec,
-		query_tld,
 		discover,
-		top_n: cli.top,
-		max_resolver_ms: cli.max_resolver_ms as f64,
+		top_n: DEFAULT_TOP_N,
+		max_resolver_ms: DEFAULT_MAX_RESOLVER_MS,
 		sort_mode: cli.sort,
-		pin_system: !cli.no_pin_system,
-		sideline: !cli.no_sideline,
-		sideline_ms: cli.sideline_ms as f64,
-		query_dotcom,
-		char_timeout: Duration::from_millis(cli.char_timeout),
-		char_attempts: cli.char_attempts,
-		query_dnssec_domains,
-		telemetry: telemetry::TelemetryLog::new(!cli.no_log),
+		query_dnssec_domains: cli.dnssec,
+		telemetry: telemetry::TelemetryLog::new(true),
 	};
 
 	// Determine run mode for telemetry
 	let mode = if cli.exhaustive { "exhaustive" } else if cli.scan { "scan" } else { "default" };
-	config.telemetry.log_config(rounds, cli.top, cli.spacing, mode, resolvers.len());
+	config.telemetry.log_config(rounds, DEFAULT_TOP_N, DEFAULT_SPACING_MS, mode, resolvers.len());
 
 	// Track resolver counts through the pipeline
 	let initial_count = resolvers.len();
@@ -256,15 +229,13 @@ async fn run() -> anyhow::Result<()> {
 		);
 	}
 
-	// Pin system resolvers to top if requested
-	if config.pin_system {
-		let (mut pinned, mut rest): (Vec<_>, Vec<_>) = results
-			.into_iter()
-			.partition(|r| r.is_system);
-		// Preserve sort order within each group
-		pinned.append(&mut rest);
-		results = pinned;
-	}
+	// Pin system resolvers to top of results
+	let (mut pinned, mut rest): (Vec<_>, Vec<_>) = results
+		.into_iter()
+		.partition(|r| r.is_system);
+	// Preserve sort order within each group
+	pinned.append(&mut rest);
+	results = pinned;
 
 	// Re-rank after filtering and pinning
 	for (i, r) in results.iter_mut().enumerate() {
@@ -281,16 +252,16 @@ async fn run() -> anyhow::Result<()> {
 	let final_count = results.len();
 	config.telemetry.log_pipeline("final_results", final_count);
 	output::print_pipeline_summary(
-		initial_count, post_discovery_count, post_char_count, final_count, cli.top,
+		initial_count, post_discovery_count, post_char_count, final_count, DEFAULT_TOP_N,
 	);
 
 	// Print results table and conclusions
-	output::print_results_table(&results, config.query_tld, config.query_dotcom, config.query_dnssec_domains);
+	output::print_results_table(&results, true, true, config.query_dnssec_domains);
 	output::print_conclusions(&results);
 
 	// Write CSV if requested
 	if let Some(path) = &cli.output {
-		output::write_csv(path, &results, config.query_tld, config.query_dotcom, config.query_dnssec_domains)?;
+		output::write_csv(path, &results, true, true, config.query_dnssec_domains)?;
 	}
 
 	// Save resolver list if requested

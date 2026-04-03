@@ -2,6 +2,16 @@
 
 ## 2026-04-03
 
+### Behavior or Interface Changes
+- Applied CLI argument minimalism: reduced from 35 flags to 12. Removed 23 rarely-changed flags (domain file overrides, timeout/concurrency/spacing tuning, discovery controls, protocol exclusions, sideline tuning, characterization params, telemetry toggle). Hardcoded sensible defaults as constants in `src/transport.rs`
+- IPv6, DoH, and DoT built-in resolvers are now always included (removed `--no-ipv6-resolvers`, `--no-doh-resolvers`, `--no-dot-resolvers`)
+- TLD and dotcom benchmarks always run (removed `--no-tld`, `--no-dotcom`)
+- System resolvers always pinned to top of results (removed `--no-pin-system`)
+- Mid-benchmark sidelining always enabled at 500ms threshold (removed `--no-sideline`, `--sideline-ms`)
+- Discovery mode is fully automatic: activates when >20 resolvers, always on for scan/exhaustive (removed `--discover`, `--no-discover`, `--top`)
+- Telemetry logging always enabled (removed `--no-log`)
+- Updated [docs/USAGE.md](docs/USAGE.md) to reflect simplified CLI
+
 ### Additions and New Features
 - Added `--exhaustive` flag for full global DNS benchmark: auto-downloads ~63K nameservers from public-dns.info, combines with all built-in lists (IPv4, IPv6, DoH, DoT), forces discovery and 30 rounds
 - Added JSONL telemetry log (`dns_benchmark.jsonl`): logs config, pipeline stages, sidelined resolvers, round completions, and final results. Enabled by default, disable with `--no-log`

@@ -38,6 +38,7 @@ pub fn parse_resolver(input: &str) -> Result<ResolverConfig> {
 		transport: DnsTransport::Udp,
 		intercepts_nxdomain: false, is_system: false,
 		ptr_name: None, rebinding_protection: None, validates_dnssec: None,
+		country_code: None, as_org: None, reliability: None,
 	})
 }
 
@@ -61,6 +62,7 @@ fn parse_doh_resolver(url: &str) -> Result<ResolverConfig> {
 		transport: DnsTransport::Doh { url: url.to_string() },
 		intercepts_nxdomain: false, is_system: false,
 		ptr_name: None, rebinding_protection: None, validates_dnssec: None,
+		country_code: None, as_org: None, reliability: None,
 	})
 }
 
@@ -87,6 +89,7 @@ fn parse_dot_resolver(input: &str) -> Result<ResolverConfig> {
 		transport: DnsTransport::Dot { hostname },
 		intercepts_nxdomain: false, is_system: false,
 		ptr_name: None, rebinding_protection: None, validates_dnssec: None,
+		country_code: None, as_org: None, reliability: None,
 	})
 }
 
@@ -299,6 +302,7 @@ pub fn default_resolvers() -> Vec<ResolverConfig> {
 			transport: DnsTransport::Udp,
 			intercepts_nxdomain: false, is_system: false,
 			ptr_name: None, rebinding_protection: None, validates_dnssec: None,
+			country_code: None, as_org: None, reliability: None,
 		},
 		ResolverConfig {
 			label: "Google".to_string(),
@@ -306,6 +310,7 @@ pub fn default_resolvers() -> Vec<ResolverConfig> {
 			transport: DnsTransport::Udp,
 			intercepts_nxdomain: false, is_system: false,
 			ptr_name: None, rebinding_protection: None, validates_dnssec: None,
+			country_code: None, as_org: None, reliability: None,
 		},
 		ResolverConfig {
 			label: "Quad9".to_string(),
@@ -313,6 +318,7 @@ pub fn default_resolvers() -> Vec<ResolverConfig> {
 			transport: DnsTransport::Udp,
 			intercepts_nxdomain: false, is_system: false,
 			ptr_name: None, rebinding_protection: None, validates_dnssec: None,
+			country_code: None, as_org: None, reliability: None,
 		},
 		ResolverConfig {
 			label: "OpenDNS".to_string(),
@@ -320,6 +326,7 @@ pub fn default_resolvers() -> Vec<ResolverConfig> {
 			transport: DnsTransport::Udp,
 			intercepts_nxdomain: false, is_system: false,
 			ptr_name: None, rebinding_protection: None, validates_dnssec: None,
+			country_code: None, as_org: None, reliability: None,
 		},
 	]
 }
@@ -370,6 +377,84 @@ pub async fn download_global_list() -> Result<String> {
 	let line_count = body.lines().filter(|l| !l.trim().is_empty()).count();
 	println!("  Downloaded {} nameservers to {}", line_count, path);
 	Ok(path)
+}
+
+/// Download nameservers.csv from public-dns.info and parse into ResolverConfigs
+/// with rich metadata (country, AS org, DNSSEC, reliability).
+/// Filters out resolvers with reliability < 0.5.
+pub async fn download_exhaustive_csv() -> Result<Vec<ResolverConfig>> {
+	let url = "https://public-dns.info/nameservers.csv";
+	println!("Downloading nameserver CSV from {}...", url);
+	let response = reqwest::get(url).await
+		.map_err(|e| anyhow!("Failed to download nameservers CSV: {}", e))?;
+	let body = response.text().await
+		.map_err(|e| anyhow!("Failed to read nameservers CSV response: {}", e))?;
+
+	let mut resolvers = Vec::new();
+	let mut reader = csv::Reader::from_reader(body.as_bytes());
+
+	for result in reader.records() {
+		let record = match result {
+			Ok(r) => r,
+			Err(_) => continue,
+		};
+		// CSV columns: ip_address,name,as_number,as_org,country_code,city,
+		//              version,error,dnssec,reliability,checked_at,created_at
+		let ip_str = record.get(0).unwrap_or("").trim();
+		if ip_str.is_empty() {
+			continue;
+		}
+
+		// Filter by reliability score (column 9)
+		let reliability_str = record.get(9).unwrap_or("");
+		let reliability: f64 = reliability_str.parse().unwrap_or(0.0);
+		if reliability < 0.5 {
+			continue;
+		}
+
+		// Parse IP address into SocketAddr with port 53
+		let addr = if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
+			SocketAddr::new(ip, 53)
+		} else {
+			continue;
+		};
+
+		// Extract metadata from CSV columns
+		let name = record.get(1).unwrap_or("").trim().to_string();
+		let as_org_val = record.get(3).unwrap_or("").trim().to_string();
+		let country = record.get(4).unwrap_or("").trim().to_string();
+		let dnssec_str = record.get(8).unwrap_or("").trim();
+
+		// Build a label: prefer reverse DNS name, then AS org, then IP
+		let label = if !name.is_empty() {
+			name.trim_end_matches('.').to_string()
+		} else if !as_org_val.is_empty() {
+			as_org_val.clone()
+		} else {
+			ip_str.to_string()
+		};
+
+		let validates_dnssec = match dnssec_str {
+			"true" => Some(true),
+			"false" => Some(false),
+			_ => None,
+		};
+
+		let ptr_name = if name.is_empty() { None } else { Some(name) };
+		let country_code = if country.is_empty() { None } else { Some(country) };
+		let as_org = if as_org_val.is_empty() { None } else { Some(as_org_val) };
+
+		resolvers.push(ResolverConfig {
+			label, addr,
+			transport: DnsTransport::Udp,
+			intercepts_nxdomain: false, is_system: false,
+			ptr_name, rebinding_protection: None, validates_dnssec,
+			country_code, as_org, reliability: Some(reliability),
+		});
+	}
+
+	println!("  Parsed {} resolvers from CSV (filtered reliability >= 0.5)", resolvers.len());
+	Ok(resolvers)
 }
 
 #[cfg(test)]
