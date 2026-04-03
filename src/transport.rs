@@ -100,4 +100,12 @@ pub struct BenchmarkConfig {
 	pub sideline: bool,
 	/// Maximum p50 latency (ms) before a resolver is sidelined mid-benchmark
 	pub sideline_ms: f64,
+	/// Enable dotcom-specific lookup timing
+	pub query_dotcom: bool,
+	/// Characterization timeout in ms (max reply time per attempt)
+	pub char_timeout: Duration,
+	/// Number of characterization attempts per resolver
+	pub char_attempts: u32,
+	/// Enable DNSSEC-signed domain benchmarking (only when dnssec is true)
+	pub query_dnssec_domains: bool,
 }

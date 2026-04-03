@@ -1,0 +1,85 @@
+# IPv6 DNS resolvers for benchmarking
+# Format: [IPv6_ADDRESS]:PORT  # Label
+# Lines starting with # are comments; inline # sets the display label
+
+# --- Cloudflare ---
+[2606:4700:4700::1111]:53  # Cloudflare-v6
+[2606:4700:4700::1001]:53  # Cloudflare-v6-secondary
+[2606:4700:4700::1112]:53  # Cloudflare-Malware-v6
+[2606:4700:4700::1002]:53  # Cloudflare-Malware-v6-secondary
+[2606:4700:4700::1113]:53  # Cloudflare-Family-v6
+[2606:4700:4700::1003]:53  # Cloudflare-Family-v6-secondary
+
+# --- Google ---
+[2001:4860:4860::8888]:53  # Google-v6
+[2001:4860:4860::8844]:53  # Google-v6-secondary
+
+# --- Quad9 ---
+[2620:fe::fe]:53           # Quad9-v6
+[2620:fe::9]:53            # Quad9-v6-secondary
+[2620:fe::10]:53           # Quad9-unsecured-v6
+[2620:fe::fe:10]:53        # Quad9-unsecured-v6-secondary
+
+# --- OpenDNS / Cisco Umbrella ---
+[2620:119:35::35]:53       # OpenDNS-v6
+[2620:119:53::53]:53       # OpenDNS-v6-secondary
+
+# --- AdGuard ---
+[2a10:50c0::ad1:ff]:53    # AdGuard-v6
+[2a10:50c0::ad2:ff]:53    # AdGuard-v6-secondary
+[2a10:50c0::bad1:ff]:53   # AdGuard-Family-v6
+[2a10:50c0::bad2:ff]:53   # AdGuard-Family-v6-secondary
+
+# --- CleanBrowsing ---
+[2a0d:2a00:1::2]:53       # CleanBrowsing-Security-v6
+[2a0d:2a00:2::2]:53       # CleanBrowsing-Family-v6
+[2a0d:2a00:1::1]:53       # CleanBrowsing-Adult-v6
+
+# --- Neustar UltraDNS ---
+[2620:74:1b::1:1]:53      # Neustar-Reliability-v6
+[2620:74:1c::2:2]:53      # Neustar-Reliability-v6-secondary
+
+# --- Yandex ---
+[2a02:6b8::feed:0ff]:53   # Yandex-v6
+[2a02:6b8:0:1::feed:0ff]:53  # Yandex-v6-secondary
+
+# --- Mullvad ---
+[2a07:e340::2]:53          # Mullvad-v6
+
+# --- Gcore ---
+[2a03:90c0:999d::1]:53    # Gcore-v6
+[2a03:90c0:9992::1]:53    # Gcore-v6-secondary
+
+# --- UncensoredDNS ---
+[2001:67c:28a4::]:53       # UncensoredDNS-anycast-v6
+[2a01:3a0:53:53::0]:53    # UncensoredDNS-unicast-v6
+
+# --- DNS.SB ---
+[2a09::]:53                # DNS-SB-v6
+[2a11::]:53                # DNS-SB-v6-secondary
+
+# --- CIRA Canadian Shield ---
+[2620:10a:80bb::10]:53     # CIRA-Private-v6
+[2620:10a:80bc::10]:53     # CIRA-Private-v6-secondary
+[2620:10a:80bb::20]:53     # CIRA-Protected-v6
+[2620:10a:80bc::20]:53     # CIRA-Protected-v6-secondary
+
+# --- Verisign ---
+[2620:74:1b::1:1]:53      # Verisign-v6
+[2620:74:1c::2:2]:53      # Verisign-v6-secondary
+
+# --- AliDNS / Alibaba (China) ---
+[2400:3200::1]:53          # AliDNS-v6
+[2400:3200:baba::1]:53    # AliDNS-v6-secondary
+
+# --- NextDNS ---
+[2a07:a8c0::]:53           # NextDNS-v6
+[2a07:a8c1::]:53           # NextDNS-v6-secondary
+
+# --- Control D ---
+[2606:1a40::]:53           # ControlD-v6
+[2606:1a40:1::]:53         # ControlD-v6-secondary
+
+# --- Digitale Gesellschaft (Switzerland) ---
+[2a05:fc84::42]:53         # DigitaleGesellschaft-v6
+[2a05:fc84::43]:53         # DigitaleGesellschaft-v6-secondary

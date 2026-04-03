@@ -253,30 +253,42 @@ pub fn system_resolvers() -> Vec<ResolverConfig> {
 	resolvers
 }
 
-/// Return a list of well-known default resolvers.
+/// Try to find a resolver file by name in resolvers/ dir, CWD, or exe dir.
+fn find_resolver_file(filename: &str) -> Option<Vec<ResolverConfig>> {
+	// Look in resolvers/ subdir first, then CWD, then next to the executable
+	let candidates = vec![
+		std::path::PathBuf::from("resolvers").join(filename),
+		std::path::PathBuf::from(filename),
+		std::env::current_exe()
+			.ok()
+			.and_then(|p| p.parent().map(|d| d.join("resolvers").join(filename)))
+			.unwrap_or_default(),
+		std::env::current_exe()
+			.ok()
+			.and_then(|p| p.parent().map(|d| d.join(filename)))
+			.unwrap_or_default(),
+	];
+	for path in &candidates {
+		if path.exists() {
+			if let Ok(resolvers) = read_resolver_file(
+				path.to_str().unwrap_or(filename),
+			) {
+				if !resolvers.is_empty() {
+					return Some(resolvers);
+				}
+			}
+		}
+	}
+	None
+}
+
+/// Return a list of well-known default resolvers (IPv4 UDP only).
 ///
 /// Reads from the bundled resolvers.txt at the repo root. Falls back to
 /// a minimal hardcoded list if the file cannot be found.
 pub fn default_resolvers() -> Vec<ResolverConfig> {
-	// Try to find resolvers.txt relative to the executable or repo root
-	let candidates = vec![
-		std::path::PathBuf::from("resolvers.txt"),
-		std::env::current_exe()
-			.ok()
-			.and_then(|p| p.parent().map(|d| d.join("resolvers.txt")))
-			.unwrap_or_default(),
-	];
-
-	for path in &candidates {
-		if path.exists() {
-			if let Ok(resolvers) = read_resolver_file(
-				path.to_str().unwrap_or("resolvers.txt"),
-			) {
-				if !resolvers.is_empty() {
-					return resolvers;
-				}
-			}
-		}
+	if let Some(resolvers) = find_resolver_file("resolvers.txt") {
+		return resolvers;
 	}
 
 	// Hardcoded fallback if resolvers.txt is not found
@@ -310,6 +322,26 @@ pub fn default_resolvers() -> Vec<ResolverConfig> {
 			ptr_name: None, rebinding_protection: None, validates_dnssec: None,
 		},
 	]
+}
+
+/// Return built-in IPv6 resolvers from resolvers_ipv6.txt.
+pub fn default_ipv6_resolvers() -> Vec<ResolverConfig> {
+	find_resolver_file("resolvers_ipv6.txt").unwrap_or_default()
+}
+
+/// Return built-in DoH resolvers from resolvers_doh.txt.
+pub fn default_doh_resolvers() -> Vec<ResolverConfig> {
+	find_resolver_file("resolvers_doh.txt").unwrap_or_default()
+}
+
+/// Return built-in DoT resolvers from resolvers_dot.txt.
+pub fn default_dot_resolvers() -> Vec<ResolverConfig> {
+	find_resolver_file("resolvers_dot.txt").unwrap_or_default()
+}
+
+/// Return the large scan list from scan_us.txt (~11K US public resolvers).
+pub fn scan_resolvers() -> Vec<ResolverConfig> {
+	find_resolver_file("scan_us.txt").unwrap_or_default()
 }
 
 #[cfg(test)]

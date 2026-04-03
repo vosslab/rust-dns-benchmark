@@ -1,0 +1,108 @@
+# DNS-over-TLS (DoT) resolvers for benchmarking
+# Format: tls://HOSTNAME/IP  # Label
+# Lines starting with # are comments; inline # sets the display label
+
+# --- Cloudflare ---
+tls://cloudflare-dns.com/1.1.1.1  # Cloudflare-DoT
+tls://cloudflare-dns.com/1.0.0.1  # Cloudflare-DoT-secondary
+tls://security.cloudflare-dns.com/1.1.1.2  # Cloudflare-Security-DoT
+tls://family.cloudflare-dns.com/1.1.1.3  # Cloudflare-Family-DoT
+
+# --- Google ---
+tls://dns.google/8.8.8.8  # Google-DoT
+tls://dns.google/8.8.4.4  # Google-DoT-secondary
+
+# --- Quad9 ---
+tls://dns.quad9.net/9.9.9.9  # Quad9-DoT
+tls://dns.quad9.net/149.112.112.112  # Quad9-DoT-secondary
+tls://dns.quad9.net/9.9.9.10  # Quad9-unsecured-DoT
+tls://dns.quad9.net/9.9.9.11  # Quad9-secure-ECS-DoT
+
+# --- OpenDNS / Cisco Umbrella ---
+tls://dns.opendns.com/208.67.222.222  # OpenDNS-DoT
+tls://dns.opendns.com/208.67.220.220  # OpenDNS-DoT-secondary
+
+# --- AdGuard ---
+tls://dns.adguard-dns.com/94.140.14.14  # AdGuard-DoT
+tls://dns.adguard-dns.com/94.140.15.15  # AdGuard-DoT-secondary
+tls://family.adguard-dns.com/94.140.14.15  # AdGuard-Family-DoT
+tls://unfiltered.adguard-dns.com/94.140.14.140  # AdGuard-Unfiltered-DoT
+
+# --- CleanBrowsing ---
+tls://security-filter-dns.cleanbrowsing.org/185.228.168.9  # CleanBrowsing-Security-DoT
+tls://family-filter-dns.cleanbrowsing.org/185.228.168.168  # CleanBrowsing-Family-DoT
+tls://adult-filter-dns.cleanbrowsing.org/185.228.168.10  # CleanBrowsing-Adult-DoT
+
+# --- NextDNS ---
+tls://dns.nextdns.io/45.90.28.0  # NextDNS-DoT
+tls://dns.nextdns.io/45.90.30.0  # NextDNS-DoT-secondary
+
+# --- Mullvad ---
+tls://doh.mullvad.net/194.242.2.2  # Mullvad-DoT
+tls://adblock.doh.mullvad.net/194.242.2.3  # Mullvad-Adblock-DoT
+tls://base.doh.mullvad.net/194.242.2.4  # Mullvad-Base-DoT
+tls://extended.doh.mullvad.net/194.242.2.5  # Mullvad-Extended-DoT
+tls://all.doh.mullvad.net/194.242.2.6  # Mullvad-All-DoT
+
+# --- Control D ---
+tls://p0.freedns.controld.com/76.76.2.0  # ControlD-Unfiltered-DoT
+tls://p1.freedns.controld.com/76.76.2.0  # ControlD-Malware-DoT
+tls://p2.freedns.controld.com/76.76.2.0  # ControlD-Ads-DoT
+tls://family.freedns.controld.com/76.76.2.0  # ControlD-Family-DoT
+
+# --- DNS.SB ---
+tls://dot.sb/185.222.222.222  # DNS-SB-DoT
+tls://dot.sb/45.11.45.11  # DNS-SB-DoT-secondary
+
+# --- CIRA Canadian Shield ---
+tls://private.canadianshield.cira.ca/149.112.121.10  # CIRA-Private-DoT
+tls://protected.canadianshield.cira.ca/149.112.121.20  # CIRA-Protected-DoT
+tls://family.canadianshield.cira.ca/149.112.121.30  # CIRA-Family-DoT
+
+# --- Wikimedia ---
+tls://wikimedia-dns.org/185.71.138.138  # Wikimedia-DoT
+
+# --- DNS4EU ---
+tls://zero.dns4eu.net/86.54.11.100  # DNS4EU-DoT
+
+# --- LibreDNS (Greece) ---
+tls://dot.libredns.gr/116.202.176.26  # LibreDNS-DoT
+
+# --- UncensoredDNS ---
+tls://anycast.uncensoreddns.org/91.239.100.100  # UncensoredDNS-DoT
+tls://unicast.uncensoreddns.org/89.233.43.71  # UncensoredDNS-Unicast-DoT
+
+# --- Digitale Gesellschaft (Switzerland) ---
+tls://dns.digitale-gesellschaft.ch/185.95.218.42  # DigitaleGesellschaft-DoT
+tls://dns.digitale-gesellschaft.ch/185.95.218.43  # DigitaleGesellschaft-DoT-secondary
+
+# --- Applied Privacy (Austria) ---
+tls://dot1.applied-privacy.net/146.255.56.98  # AppliedPrivacy-DoT
+
+# --- Tiarap (Singapore) ---
+tls://dot.tiarap.org/174.138.21.128  # Tiarap-DoT
+
+# --- AliDNS / Alibaba (China) ---
+tls://dns.alidns.com/223.5.5.5  # AliDNS-DoT
+tls://dns.alidns.com/223.6.6.6  # AliDNS-DoT-secondary
+
+# --- IIJ (Japan) ---
+tls://public.dns.iij.jp/210.138.175.244  # IIJ-DoT
+
+# --- Gcore ---
+tls://dns.gcorelabs.com/95.85.95.85  # Gcore-DoT
+
+# --- Yandex ---
+tls://common.dot.dns.yandex.net/77.88.8.8  # Yandex-DoT
+tls://common.dot.dns.yandex.net/77.88.8.1  # Yandex-DoT-secondary
+
+# --- Comss.one (Russia) ---
+tls://dns.comss.one/93.115.24.204  # Comss-DoT
+
+# --- BlahDNS (Finland/Japan) ---
+tls://dot-fi.blahdns.com/95.216.212.177  # BlahDNS-Finland-DoT
+tls://dot-jp.blahdns.com/139.162.112.47  # BlahDNS-Japan-DoT
+tls://dot-de.blahdns.com/159.69.198.101  # BlahDNS-Germany-DoT
+
+# --- DNSForge (Germany) ---
+tls://dnsforge.de/176.9.93.198  # DNSForge-DoT

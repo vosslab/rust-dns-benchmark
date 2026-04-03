@@ -106,4 +106,40 @@ pub struct Cli {
 	/// Maximum p50 latency (ms) before sidelining a resolver mid-benchmark
 	#[arg(long = "sideline-ms", default_value = "500")]
 	pub sideline_ms: u64,
+
+	/// Exclude built-in IPv6 resolvers
+	#[arg(long = "no-ipv6-resolvers")]
+	pub no_ipv6_resolvers: bool,
+
+	/// Exclude built-in DoH resolvers
+	#[arg(long = "no-doh-resolvers")]
+	pub no_doh_resolvers: bool,
+
+	/// Exclude built-in DoT resolvers
+	#[arg(long = "no-dot-resolvers")]
+	pub no_dot_resolvers: bool,
+
+	/// Disable dotcom-specific lookup timing
+	#[arg(long = "no-dotcom")]
+	pub no_dotcom: bool,
+
+	/// File containing dotcom domains to query
+	#[arg(long = "dotcom-domains")]
+	pub dotcom_domains: Option<String>,
+
+	/// Characterization timeout in milliseconds (max reply time per attempt)
+	#[arg(long = "char-timeout", default_value = "50")]
+	pub char_timeout: u64,
+
+	/// Number of characterization attempts per resolver
+	#[arg(long = "char-attempts", default_value = "10")]
+	pub char_attempts: u32,
+
+	/// File containing DNSSEC-signed domains for benchmarking
+	#[arg(long = "dnssec-domains")]
+	pub dnssec_domains: Option<String>,
+
+	/// Massive-scale scan: load ~11K public resolvers, discover survivors, benchmark with 30 rounds
+	#[arg(long = "scan")]
+	pub scan: bool,
 }

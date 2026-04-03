@@ -3,6 +3,34 @@
 ## 2026-04-02
 
 ### Additions and New Features
+- Expanded built-in resolver lists: moved to `resolvers/` directory with 4 separate files
+  - `resolvers/resolvers.txt`: ~130 IPv4 UDP resolvers (was 89), added Mullvad, Gcore, UncensoredDNS, NTT, Comcast, and 20+ more providers
+  - `resolvers/resolvers_ipv6.txt`: ~45 IPv6 resolvers (new) covering all major providers
+  - `resolvers/resolvers_doh.txt`: ~80 DoH resolvers (new) including Cloudflare, Google, Quad9, Mullvad, ControlD, CIRA, regional endpoints
+  - `resolvers/resolvers_dot.txt`: ~60 DoT resolvers (new) with SNI hostnames for all major providers
+- Added `--no-ipv6-resolvers`, `--no-doh-resolvers`, `--no-dot-resolvers` flags to selectively exclude protocol categories
+- Added dotcom-specific lookup timing: 20 `.com` domains measured separately to benchmark dotcom TLD resolution
+  - New `--dotcom-domains` and `--no-dotcom` CLI flags
+  - Dotcom score factored into overall ranking (3-way average with warm and cold)
+  - DotCom p50 column in results table and CSV
+- Added DNSSEC-signed domain benchmarking: 15 known DNSSEC-signed domains benchmarked when `--dnssec` is enabled
+  - New `--dnssec-domains` CLI flag for custom DNSSEC domain list
+  - DNSSEC p50 column in results table and CSV when enabled
+- Added v2-style characterization sidelining: resolvers get up to 10 attempts (configurable) to reply within 50ms (configurable) before being sidelined
+  - New `--char-timeout` (default 50ms) and `--char-attempts` (default 10) CLI flags
+  - Unreachable resolvers removed before NXDOMAIN/rebinding/DNSSEC characterization
+- Added resolver pipeline summary showing counts at each stage: initial, post-discovery, post-characterization, final
+- Added `--sort dotcom` option for sorting results by dotcom p50 latency
+- Expanded conclusions section with DNSSEC validation warnings, slow-network detection, and IPv4 vs IPv6 side-by-side comparison for same-provider pairs
+- Structured exit codes expanded: 0-8 covering file not found, no IPs, too many resolvers, no connectivity, lost connectivity, log file errors
+- Added `--scan` flag for massive-scale testing: loads ~11,549 US public DNS resolvers from bundled `resolvers/scan_us.txt` (sourced from public-dns.info), forces discovery mode, and runs 30 rounds for thorough benchmarking
+
+### Behavior or Interface Changes
+- Resolver files moved from repo root to `resolvers/` directory; loader searches `resolvers/` first, then CWD, then exe dir
+- `run_characterization()` now takes `&BenchmarkConfig` instead of bare timeout for access to char_timeout/char_attempts
+- Overall score now averages warm + cold + dotcom (3-way) when dotcom is enabled; was warm + cold only
+- Default resolver list includes IPv6, DoH, and DoT resolvers (use `--no-*-resolvers` flags to exclude)
+
 - Added colored output to results table: score/latency green/yellow/red by threshold, success rate colored, NXDOMAIN/DNSSEC/rebind status colored, top-3 ranks bold green
 - Added `--save-resolvers` CLI flag to export surviving resolver list to a file after benchmark
 - Added conclusions summary printed after results table: fastest resolver, system resolver ranking, performance comparison, NXDOMAIN interception warnings

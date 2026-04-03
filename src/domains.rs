@@ -148,6 +148,59 @@ pub fn default_tld_domains() -> Vec<String> {
 	].into_iter().map(String::from).collect()
 }
 
+/// Return a list of .com domains for dotcom-specific lookup timing.
+///
+/// The original GRC DNS Benchmark measures how fast resolvers consult
+/// dotcom TLD servers separately from general uncached lookups.
+pub fn default_dotcom_domains() -> Vec<String> {
+	vec![
+		"zillow.com",
+		"wayfair.com",
+		"costco.com",
+		"nordstrom.com",
+		"chewy.com",
+		"zappos.com",
+		"newegg.com",
+		"overstock.com",
+		"kohls.com",
+		"macys.com",
+		"homedepot.com",
+		"lowes.com",
+		"bestbuy.com",
+		"target.com",
+		"walmart.com",
+		"etsy.com",
+		"shopify.com",
+		"squarespace.com",
+		"godaddy.com",
+		"namecheap.com",
+	].into_iter().map(String::from).collect()
+}
+
+/// Return a list of known DNSSEC-signed domains for benchmarking.
+///
+/// When --dnssec is enabled, these domains are benchmarked separately
+/// to measure the overhead of DNSSEC validation.
+pub fn default_dnssec_domains() -> Vec<String> {
+	vec![
+		"cloudflare.com",
+		"isc.org",
+		"ietf.org",
+		"icann.org",
+		"verisign.com",
+		"nist.gov",
+		"nasa.gov",
+		"energy.gov",
+		"treasury.gov",
+		"sec.gov",
+		"irs.gov",
+		"fda.gov",
+		"cdc.gov",
+		"nih.gov",
+		"whitehouse.gov",
+	].into_iter().map(String::from).collect()
+}
+
 /// Read domains from a file, one per line.
 ///
 /// Blank lines and lines starting with '#' are skipped.

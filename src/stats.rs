@@ -12,6 +12,8 @@ pub enum SortMode {
 	Cold,
 	/// Sort by TLD p50 latency
 	Tld,
+	/// Sort by dotcom p50 latency
+	Dotcom,
 	/// Sort alphabetically by resolver name
 	Name,
 }
@@ -39,6 +41,8 @@ pub struct ResolverStats {
 	pub warm: SetStats,
 	pub cold: SetStats,
 	pub tld: Option<SetStats>,
+	pub dotcom: Option<SetStats>,
+	pub dnssec_bench: Option<SetStats>,
 	pub overall_score: f64,
 	pub success_rate: f64,
 	pub intercepts_nxdomain: bool,
@@ -258,6 +262,13 @@ pub fn rank_resolvers(mut resolvers: Vec<ResolverStats>, sort_mode: SortMode) ->
 				cmp_f64(a_val, b_val)
 			});
 		}
+		SortMode::Dotcom => {
+			resolvers.sort_by(|a, b| {
+				let a_val = a.dotcom.as_ref().map(|t| t.p50_ms).unwrap_or(f64::MAX);
+				let b_val = b.dotcom.as_ref().map(|t| t.p50_ms).unwrap_or(f64::MAX);
+				cmp_f64(a_val, b_val)
+			});
+		}
 		SortMode::Name => {
 			resolvers.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
 		}
@@ -359,6 +370,8 @@ mod tests {
 				warm: SetStats::default(),
 				cold: SetStats::default(),
 				tld: None,
+				dotcom: None,
+				dnssec_bench: None,
 				overall_score: 100.0,
 				success_rate: 95.0,
 				intercepts_nxdomain: false,
@@ -374,6 +387,8 @@ mod tests {
 				warm: SetStats::default(),
 				cold: SetStats::default(),
 				tld: None,
+				dotcom: None,
+				dnssec_bench: None,
 				overall_score: 10.0,
 				success_rate: 99.0,
 				intercepts_nxdomain: false,
@@ -389,6 +404,8 @@ mod tests {
 				warm: SetStats::default(),
 				cold: SetStats::default(),
 				tld: None,
+				dotcom: None,
+				dnssec_bench: None,
 				overall_score: 50.0,
 				success_rate: 97.0,
 				intercepts_nxdomain: false,
@@ -441,6 +458,8 @@ mod tests {
 					warm: SetStats::default(),
 					cold: SetStats::default(),
 					tld: None,
+					dotcom: None,
+					dnssec_bench: None,
 					overall_score: 10.0,
 					success_rate: 99.0,
 					intercepts_nxdomain: false,
@@ -461,6 +480,8 @@ mod tests {
 					warm: SetStats::default(),
 					cold: SetStats::default(),
 					tld: None,
+					dotcom: None,
+					dnssec_bench: None,
 					overall_score: 11.0,
 					success_rate: 98.0,
 					intercepts_nxdomain: false,
@@ -481,6 +502,8 @@ mod tests {
 					warm: SetStats::default(),
 					cold: SetStats::default(),
 					tld: None,
+					dotcom: None,
+					dnssec_bench: None,
 					overall_score: 50.0,
 					success_rate: 95.0,
 					intercepts_nxdomain: false,
@@ -516,6 +539,8 @@ mod tests {
 					warm: SetStats::default(),
 					cold: SetStats::default(),
 					tld: None,
+					dotcom: None,
+					dnssec_bench: None,
 					overall_score: 10.0,
 					success_rate: 99.0,
 					intercepts_nxdomain: false,
@@ -536,6 +561,8 @@ mod tests {
 					warm: SetStats::default(),
 					cold: SetStats::default(),
 					tld: None,
+					dotcom: None,
+					dnssec_bench: None,
 					overall_score: 100.0,
 					success_rate: 95.0,
 					intercepts_nxdomain: false,

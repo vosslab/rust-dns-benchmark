@@ -1,0 +1,128 @@
+# DNS-over-HTTPS (DoH) resolvers for benchmarking
+# Format: https://HOST/dns-query  # Label
+# Lines starting with # are comments; inline # sets the display label
+
+# --- Cloudflare ---
+https://cloudflare-dns.com/dns-query  # Cloudflare-DoH
+https://1.1.1.1/dns-query  # Cloudflare-DoH-IP
+https://1.0.0.1/dns-query  # Cloudflare-DoH-IP-secondary
+https://mozilla.cloudflare-dns.com/dns-query  # Cloudflare-Mozilla-DoH
+https://security.cloudflare-dns.com/dns-query  # Cloudflare-Security-DoH
+https://family.cloudflare-dns.com/dns-query  # Cloudflare-Family-DoH
+
+# --- Google ---
+https://dns.google/dns-query  # Google-DoH
+https://8.8.8.8/dns-query  # Google-DoH-IP
+https://8.8.4.4/dns-query  # Google-DoH-IP-secondary
+
+# --- Quad9 ---
+https://dns.quad9.net/dns-query  # Quad9-DoH
+https://dns9.quad9.net/dns-query  # Quad9-secure-DoH
+https://dns10.quad9.net/dns-query  # Quad9-unsecured-DoH
+https://dns11.quad9.net/dns-query  # Quad9-secure-ECS-DoH
+
+# --- OpenDNS / Cisco Umbrella ---
+https://doh.opendns.com/dns-query  # OpenDNS-DoH
+https://doh.familyshield.opendns.com/dns-query  # OpenDNS-FamilyShield-DoH
+
+# --- AdGuard ---
+https://dns.adguard-dns.com/dns-query  # AdGuard-DoH
+https://family.adguard-dns.com/dns-query  # AdGuard-Family-DoH
+https://unfiltered.adguard-dns.com/dns-query  # AdGuard-Unfiltered-DoH
+
+# --- CleanBrowsing ---
+https://doh.cleanbrowsing.org/doh/security-filter/  # CleanBrowsing-Security-DoH
+https://doh.cleanbrowsing.org/doh/family-filter/  # CleanBrowsing-Family-DoH
+https://doh.cleanbrowsing.org/doh/adult-filter/  # CleanBrowsing-Adult-DoH
+
+# --- NextDNS ---
+https://dns.nextdns.io/dns-query  # NextDNS-DoH
+https://45.90.28.0/dns-query  # NextDNS-DoH-IP
+https://45.90.30.0/dns-query  # NextDNS-DoH-IP-secondary
+
+# --- Mullvad ---
+https://doh.mullvad.net/dns-query  # Mullvad-DoH
+https://adblock.doh.mullvad.net/dns-query  # Mullvad-Adblock-DoH
+https://base.doh.mullvad.net/dns-query  # Mullvad-Base-DoH
+https://extended.doh.mullvad.net/dns-query  # Mullvad-Extended-DoH
+https://all.doh.mullvad.net/dns-query  # Mullvad-All-DoH
+
+# --- Control D ---
+https://freedns.controld.com/p0  # ControlD-Unfiltered-DoH
+https://freedns.controld.com/p1  # ControlD-Malware-DoH
+https://freedns.controld.com/p2  # ControlD-Ads-DoH
+https://freedns.controld.com/p3  # ControlD-Social-DoH
+https://freedns.controld.com/family  # ControlD-Family-DoH
+
+# --- DNS.SB ---
+https://doh.dns.sb/dns-query  # DNS-SB-DoH
+https://45.11.45.11/dns-query  # DNS-SB-DoH-IP
+
+# --- CIRA Canadian Shield ---
+https://private.canadianshield.cira.ca/dns-query  # CIRA-Private-DoH
+https://protected.canadianshield.cira.ca/dns-query  # CIRA-Protected-DoH
+https://family.canadianshield.cira.ca/dns-query  # CIRA-Family-DoH
+
+# --- Wikimedia ---
+https://wikimedia-dns.org/dns-query  # Wikimedia-DoH
+
+# --- DNS4EU ---
+https://zero.dns4eu.net/dns-query  # DNS4EU-DoH
+
+# --- LibreDNS (Greece) ---
+https://doh.libredns.gr/dns-query  # LibreDNS-DoH
+https://doh.libredns.gr/ads  # LibreDNS-Adblock-DoH
+
+# --- UncensoredDNS ---
+https://anycast.uncensoreddns.org/dns-query  # UncensoredDNS-DoH
+https://unicast.uncensoreddns.org/dns-query  # UncensoredDNS-Unicast-DoH
+
+# --- Digitale Gesellschaft (Switzerland) ---
+https://dns.digitale-gesellschaft.ch/dns-query  # DigitaleGesellschaft-DoH
+
+# --- Applied Privacy (Austria) ---
+https://doh.applied-privacy.net/query  # AppliedPrivacy-DoH
+
+# --- AhaDNS ---
+https://blitz.ahadns.com/  # AhaDNS-Blitz-DoH
+
+# --- Tiarap (Singapore) ---
+https://doh.tiarap.org/dns-query  # Tiarap-DoH
+
+# --- AliDNS / Alibaba (China) ---
+https://dns.alidns.com/dns-query  # AliDNS-DoH
+
+# --- 360 Secure DNS (China) ---
+https://doh.360.cn/dns-query  # 360DNS-DoH
+
+# --- IIJ (Japan) ---
+https://public.dns.iij.jp/dns-query  # IIJ-DoH
+
+# --- Restena (Luxembourg) ---
+https://kaitain.restena.lu/dns-query  # Restena-DoH
+
+# --- Gcore ---
+https://dns.gcorelabs.com/dns-query  # Gcore-DoH
+
+# --- Yandex ---
+https://common.dot.dns.yandex.net/dns-query  # Yandex-DoH
+
+# --- Neustar UltraDNS ---
+https://doh.xfinity.com/dns-query  # Neustar-DoH
+
+# --- Comss.one (Russia) ---
+https://dns.comss.one/dns-query  # Comss-DoH
+
+# --- BlahDNS (Finland/Japan) ---
+https://doh-fi.blahdns.com/dns-query  # BlahDNS-Finland-DoH
+https://doh-jp.blahdns.com/dns-query  # BlahDNS-Japan-DoH
+https://doh-de.blahdns.com/dns-query  # BlahDNS-Germany-DoH
+
+# --- RethinkDNS ---
+https://basic.rethinkdns.com/dns-query  # RethinkDNS-DoH
+
+# --- DNSForge (Germany) ---
+https://dnsforge.de/dns-query  # DNSForge-DoH
+
+# --- Oszx (UK) ---
+https://doh.oszx.co/dns-query  # Oszx-DoH

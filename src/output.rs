@@ -34,6 +34,8 @@ pub fn print_config_summary(
 	warm_count: usize,
 	cold_count: usize,
 	tld_count: usize,
+	dotcom_count: usize,
+	dnssec_count: usize,
 	config: &BenchmarkConfig,
 ) {
 	println!("DNS Benchmark Configuration");
@@ -58,6 +60,14 @@ pub fn print_config_summary(
 	if config.query_tld {
 		println!("TLD domains:    {}", tld_count);
 	}
+	if config.query_dotcom {
+		println!("Dotcom domains: {}", dotcom_count);
+	}
+	if config.query_dnssec_domains {
+		println!("DNSSEC domains: {}", dnssec_count);
+	}
+	println!("Char timeout:   {} ms", config.char_timeout.as_millis());
+	println!("Char attempts:  {}", config.char_attempts);
 	println!("Rounds:         {}", config.rounds);
 	println!("Timeout:        {} ms", config.timeout.as_millis());
 	println!("Concurrency:    {}", config.max_inflight);
@@ -74,6 +84,7 @@ pub fn print_config_summary(
 		crate::stats::SortMode::Warm => "warm (cached) p50",
 		crate::stats::SortMode::Cold => "cold (uncached) p50",
 		crate::stats::SortMode::Tld => "TLD p50",
+		crate::stats::SortMode::Dotcom => "dotcom p50",
 		crate::stats::SortMode::Name => "name",
 	};
 	println!("Sort by:        {}", sort_label);
@@ -87,7 +98,7 @@ pub fn print_config_summary(
 }
 
 /// Print the benchmark results as a formatted table with color coding.
-pub fn print_results_table(results: &[ScoredResolver], show_tld: bool) {
+pub fn print_results_table(results: &[ScoredResolver], show_tld: bool, show_dotcom: bool, show_dnssec: bool) {
 	let mut table = Table::new();
 	table.load_preset(UTF8_FULL);
 	table.set_content_arrangement(ContentArrangement::Dynamic);
@@ -106,6 +117,12 @@ pub fn print_results_table(results: &[ScoredResolver], show_tld: bool) {
 	header.extend_from_slice(&["Score", "Warm p50", "Cold p50"]);
 	if show_tld {
 		header.push("TLD p50");
+	}
+	if show_dotcom {
+		header.push("DotCom p50");
+	}
+	if show_dnssec {
+		header.push("DNSSEC p50");
 	}
 	header.push("Success %");
 	header.push("NXDOMAIN");
@@ -183,6 +200,24 @@ pub fn print_results_table(results: &[ScoredResolver], show_tld: bool) {
 			}
 		}
 
+		if show_dotcom {
+			if let Some(ref dc) = s.dotcom {
+				let dc_text = format!("{:.1} ms", dc.p50_ms);
+				row.push(Cell::new(&dc_text).fg(latency_color(dc.p50_ms)));
+			} else {
+				row.push(Cell::new("-"));
+			}
+		}
+
+		if show_dnssec {
+			if let Some(ref ds) = s.dnssec_bench {
+				let ds_text = format!("{:.1} ms", ds.p50_ms);
+				row.push(Cell::new(&ds_text).fg(latency_color(ds.p50_ms)));
+			} else {
+				row.push(Cell::new("-"));
+			}
+		}
+
 		// Success rate with color
 		let success_text = format!("{:.1}%", s.success_rate);
 		row.push(Cell::new(&success_text).fg(success_color(s.success_rate)));
@@ -215,6 +250,25 @@ pub fn print_results_table(results: &[ScoredResolver], show_tld: bool) {
 	if has_ties {
 		println!("\nNote: resolvers with shared rank (e.g. 1-3) are statistically tied.");
 	}
+}
+
+/// Print a summary of how many resolvers survived each pipeline stage.
+pub fn print_pipeline_summary(
+	initial: usize,
+	post_discovery: usize,
+	post_char: usize,
+	final_count: usize,
+) {
+	println!("\nResolver Pipeline");
+	println!("-----------------");
+	println!("  Started:              {}", initial);
+	if post_discovery != initial {
+		println!("  After discovery:      {}", post_discovery);
+	}
+	if post_char != post_discovery {
+		println!("  After characterization: {}", post_char);
+	}
+	println!("  Final results:        {}", final_count);
 }
 
 /// Print heuristic conclusions about the benchmark results.
@@ -257,11 +311,51 @@ pub fn print_conclusions(results: &[ScoredResolver]) {
 				r.stats.label,
 			);
 		}
+		// Warn about missing DNSSEC validation
+		if r.stats.validates_dnssec == Some(false) {
+			println!(
+				"  Warning: {} does not validate DNSSEC signatures.",
+				r.stats.label,
+			);
+		}
+	}
+
+	// Warn if all resolvers are slow
+	let all_slow = results.iter().all(|r| r.stats.warm.p50_ms > 100.0);
+	if all_slow {
+		println!("  Warning: all tested resolvers have warm p50 > 100 ms. Your network may have high latency.");
+	}
+
+	// IPv4 vs IPv6 comparison for same-provider pairs
+	let mut pairs_printed = false;
+	for r in results {
+		// Look for a matching -v6 suffix entry
+		let base_label = r.stats.label.trim_end_matches("-v6");
+		if base_label == r.stats.label {
+			// This is the IPv4 entry; look for the v6 pair
+			let v6_label = format!("{}-v6", r.stats.label);
+			if let Some(v6) = results.iter().find(|x| x.stats.label == v6_label) {
+				if !pairs_printed {
+					println!("\nIPv4 vs IPv6 Comparison");
+					println!("----------------------");
+					pairs_printed = true;
+				}
+				let diff_pct = if r.stats.overall_score > 0.0 {
+					((v6.stats.overall_score - r.stats.overall_score) / r.stats.overall_score) * 100.0
+				} else {
+					0.0
+				};
+				let direction = if diff_pct > 0.0 { "slower" } else { "faster" };
+				println!("  {} IPv4: {:.1} ms vs IPv6: {:.1} ms ({:.0}% {})",
+					base_label, r.stats.warm.p50_ms, v6.stats.warm.p50_ms,
+					diff_pct.abs(), direction);
+			}
+		}
 	}
 }
 
 /// Write benchmark results to a CSV file.
-pub fn write_csv(path: &str, results: &[ScoredResolver], show_tld: bool) -> Result<()> {
+pub fn write_csv(path: &str, results: &[ScoredResolver], show_tld: bool, show_dotcom: bool, show_dnssec: bool) -> Result<()> {
 	let mut writer = csv::Writer::from_path(path)?;
 
 	// Build header
@@ -276,6 +370,18 @@ pub fn write_csv(path: &str, results: &[ScoredResolver], show_tld: bool) -> Resu
 		header.extend_from_slice(&[
 			"tld_p50_ms", "tld_p95_ms", "tld_mean_ms", "tld_stddev_ms",
 			"tld_success", "tld_timeout", "tld_total", "tld_score",
+		]);
+	}
+	if show_dotcom {
+		header.extend_from_slice(&[
+			"dotcom_p50_ms", "dotcom_p95_ms", "dotcom_mean_ms", "dotcom_stddev_ms",
+			"dotcom_success", "dotcom_timeout", "dotcom_total", "dotcom_score",
+		]);
+	}
+	if show_dnssec {
+		header.extend_from_slice(&[
+			"dnssec_p50_ms", "dnssec_p95_ms", "dnssec_mean_ms", "dnssec_stddev_ms",
+			"dnssec_success", "dnssec_timeout", "dnssec_total", "dnssec_score",
 		]);
 	}
 	header.extend_from_slice(&[
@@ -325,6 +431,44 @@ pub fn write_csv(path: &str, results: &[ScoredResolver], show_tld: bool) -> Resu
 					tld.timeout_count.to_string(),
 					tld.total_count.to_string(),
 					format!("{:.2}", tld.score),
+				]);
+			} else {
+				row.extend_from_slice(&[
+					String::new(), String::new(), String::new(), String::new(),
+					String::new(), String::new(), String::new(), String::new(),
+				]);
+			}
+		}
+		if show_dotcom {
+			if let Some(ref dc) = s.dotcom {
+				row.extend_from_slice(&[
+					format!("{:.2}", dc.p50_ms),
+					format!("{:.2}", dc.p95_ms),
+					format!("{:.2}", dc.mean_ms),
+					format!("{:.2}", dc.stddev_ms),
+					dc.success_count.to_string(),
+					dc.timeout_count.to_string(),
+					dc.total_count.to_string(),
+					format!("{:.2}", dc.score),
+				]);
+			} else {
+				row.extend_from_slice(&[
+					String::new(), String::new(), String::new(), String::new(),
+					String::new(), String::new(), String::new(), String::new(),
+				]);
+			}
+		}
+		if show_dnssec {
+			if let Some(ref ds) = s.dnssec_bench {
+				row.extend_from_slice(&[
+					format!("{:.2}", ds.p50_ms),
+					format!("{:.2}", ds.p95_ms),
+					format!("{:.2}", ds.mean_ms),
+					format!("{:.2}", ds.stddev_ms),
+					ds.success_count.to_string(),
+					ds.timeout_count.to_string(),
+					ds.total_count.to_string(),
+					format!("{:.2}", ds.score),
 				]);
 			} else {
 				row.extend_from_slice(&[

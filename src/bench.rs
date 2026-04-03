@@ -391,14 +391,81 @@ struct QueryTask {
 /// Sends a single probe query per resolver for a known-bad domain.
 /// If the resolver returns NoError with A records, it is marked as intercepting.
 pub async fn run_characterization(
-	resolvers: &mut [ResolverConfig],
-	timeout: Duration,
+	resolvers: &mut Vec<ResolverConfig>,
+	config: &BenchmarkConfig,
 	nxdomain_domains: &[String],
 ) {
+	let timeout = config.timeout;
+
+	// Phase 0: v2-style reachability pre-check
+	// Give each resolver up to char_attempts chances to reply within char_timeout
+	let char_timeout = config.char_timeout;
+	let char_attempts = config.char_attempts;
+	println!("Reachability pre-check ({} resolvers, {} attempts, {} ms timeout)...",
+		resolvers.len(), char_attempts, char_timeout.as_millis());
+
+	let semaphore = std::sync::Arc::new(Semaphore::new(32));
+	let mut reachability_handles = Vec::new();
+
+	for (i, resolver) in resolvers.iter().enumerate() {
+		let addr = resolver.addr;
+		let label = resolver.label.clone();
+		let sem = semaphore.clone();
+		let ct = char_timeout;
+		let attempts = char_attempts;
+
+		reachability_handles.push(tokio::spawn(async move {
+			let _permit = sem.acquire().await.unwrap();
+			// Send up to `attempts` A queries for google.com, check if any reply in time
+			let mut any_fast = false;
+			for _ in 0..attempts {
+				let txid: u16 = rand::random();
+				let query_bytes = match crate::dns::build_query(
+					"google.com", crate::transport::QueryType::A, txid, false,
+				) {
+					Ok(b) => b,
+					Err(_) => continue,
+				};
+				let result = send_udp_query(addr, &query_bytes, ct, txid, "google.com", crate::transport::QueryType::A).await;
+				if result.success {
+					any_fast = true;
+					break;
+				}
+			}
+			(i, label, addr, any_fast)
+		}));
+	}
+
+	// Collect reachability results and sideline unreachable resolvers
+	let mut reachable = vec![false; resolvers.len()];
+	for handle in reachability_handles {
+		match handle.await {
+			Ok((idx, label, addr, is_reachable)) => {
+				reachable[idx] = is_reachable;
+				let status = if is_reachable { "reachable" } else { "SIDELINED (unreachable)" };
+				println!("  {} ({}): {}", label, addr.ip(), status);
+			}
+			Err(e) => {
+				eprintln!("Warning: reachability check failed: {}", e);
+			}
+		}
+	}
+
+	// Remove unreachable resolvers
+	let before = resolvers.len();
+	let mut idx = 0;
+	resolvers.retain(|_| {
+		let keep = reachable[idx];
+		idx += 1;
+		keep
+	});
+	let sidelined = before - resolvers.len();
+	println!("  {} reachable, {} sidelined, {} total", resolvers.len(), sidelined, before);
+	println!();
+
+	// Phase 1: NXDOMAIN interception check
 	println!("Checking NXDOMAIN interception ({} resolvers)...", resolvers.len());
 
-	// Run all probes concurrently for speed
-	let semaphore = std::sync::Arc::new(Semaphore::new(32));
 	let mut handles = Vec::new();
 
 	for (i, resolver) in resolvers.iter().enumerate() {
@@ -638,11 +705,14 @@ pub async fn run_discovery(
 ///
 /// Executes multiple rounds of queries, shuffling the order each round.
 /// Returns scored and ranked resolver results.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_benchmark(
 	resolvers: &[ResolverConfig],
 	warm_domains: &[String],
 	cold_domains: &[String],
 	tld_domains: &[String],
+	dotcom_domains: &[String],
+	dnssec_domains: &[String],
 	config: &BenchmarkConfig,
 	doh_clients: &DohClientPool,
 ) -> Result<Vec<ScoredResolver>> {
@@ -685,6 +755,32 @@ pub async fn run_benchmark(
 						domain: domain.clone(),
 						query_type: qt,
 						set_name: "tld".to_string(),
+					});
+				}
+			}
+		}
+		// Dotcom domains (only if enabled)
+		if config.query_dotcom {
+			for domain in dotcom_domains {
+				for &qt in &query_types {
+					tasks.push(QueryTask {
+						resolver: resolver.clone(),
+						domain: domain.clone(),
+						query_type: qt,
+						set_name: "dotcom".to_string(),
+					});
+				}
+			}
+		}
+		// DNSSEC-signed domains (only when DNSSEC is enabled)
+		if config.query_dnssec_domains {
+			for domain in dnssec_domains {
+				for &qt in &query_types {
+					tasks.push(QueryTask {
+						resolver: resolver.clone(),
+						domain: domain.clone(),
+						query_type: qt,
+						set_name: "dnssec".to_string(),
 					});
 				}
 			}
@@ -886,6 +982,22 @@ pub async fn run_benchmark(
 				if result.success { entry.tld_success += 1; }
 				if result.timeout { entry.tld_timeout += 1; }
 			}
+			"dotcom" => {
+				if result.success {
+					entry.dotcom_latencies.push(latency_ms);
+				}
+				entry.dotcom_total += 1;
+				if result.success { entry.dotcom_success += 1; }
+				if result.timeout { entry.dotcom_timeout += 1; }
+			}
+			"dnssec" => {
+				if result.success {
+					entry.dnssec_latencies.push(latency_ms);
+				}
+				entry.dnssec_total += 1;
+				if result.success { entry.dnssec_success += 1; }
+				if result.timeout { entry.dnssec_timeout += 1; }
+			}
 			_ => {}
 		}
 	}
@@ -938,10 +1050,36 @@ pub async fn run_benchmark(
 			None
 		};
 
-		// Overall score is the average of warm and cold set scores
-		let overall_score = (warm_stats.score + cold_stats.score) / 2.0;
-		let total = agg.warm_total + agg.cold_total + agg.tld_total;
-		let total_success = agg.warm_success + agg.cold_success + agg.tld_success;
+		// Dotcom stats (optional)
+		let dotcom_stats = if config.query_dotcom && agg.dotcom_total > 0 {
+			Some(compute_set_stats(
+				&agg.dotcom_latencies, agg.dotcom_success,
+				agg.dotcom_timeout, agg.dotcom_total, timeout_penalty_ms,
+			))
+		} else {
+			None
+		};
+
+		// DNSSEC benchmark stats (optional)
+		let dnssec_bench_stats = if config.query_dnssec_domains && agg.dnssec_total > 0 {
+			Some(compute_set_stats(
+				&agg.dnssec_latencies, agg.dnssec_success,
+				agg.dnssec_timeout, agg.dnssec_total, timeout_penalty_ms,
+			))
+		} else {
+			None
+		};
+
+		// Overall score: average of warm, cold, and dotcom (if present)
+		let overall_score = if let Some(ref dc) = dotcom_stats {
+			(warm_stats.score + cold_stats.score + dc.score) / 3.0
+		} else {
+			(warm_stats.score + cold_stats.score) / 2.0
+		};
+		let total = agg.warm_total + agg.cold_total + agg.tld_total
+			+ agg.dotcom_total + agg.dnssec_total;
+		let total_success = agg.warm_success + agg.cold_success + agg.tld_success
+			+ agg.dotcom_success + agg.dnssec_success;
 		let success_rate = if total > 0 {
 			(total_success as f64 / total as f64) * 100.0
 		} else {
@@ -985,6 +1123,8 @@ pub async fn run_benchmark(
 			warm: warm_stats,
 			cold: cold_stats,
 			tld: tld_stats,
+			dotcom: dotcom_stats,
+			dnssec_bench: dnssec_bench_stats,
 			overall_score,
 			success_rate,
 			intercepts_nxdomain: intercepts,
@@ -1023,13 +1163,21 @@ struct ResolverAggregation {
 	warm_latencies: Vec<f64>,
 	cold_latencies: Vec<f64>,
 	tld_latencies: Vec<f64>,
+	dotcom_latencies: Vec<f64>,
+	dnssec_latencies: Vec<f64>,
 	warm_success: usize,
 	cold_success: usize,
 	tld_success: usize,
+	dotcom_success: usize,
+	dnssec_success: usize,
 	warm_total: usize,
 	cold_total: usize,
 	tld_total: usize,
+	dotcom_total: usize,
+	dnssec_total: usize,
 	warm_timeout: usize,
 	cold_timeout: usize,
 	tld_timeout: usize,
+	dotcom_timeout: usize,
+	dnssec_timeout: usize,
 }

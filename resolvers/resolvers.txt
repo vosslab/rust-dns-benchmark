@@ -148,3 +148,80 @@
 
 # --- Njalla (Sweden) ---
 95.215.19.53     # Njalla
+
+# --- Mullvad ---
+194.242.2.2      # Mullvad
+194.242.2.3      # Mullvad-adblock
+194.242.2.4      # Mullvad-base
+194.242.2.5      # Mullvad-extended
+194.242.2.6      # Mullvad-all
+
+# --- Gcore ---
+95.85.95.85      # Gcore
+2.56.220.2       # Gcore-secondary
+
+# --- UncensoredDNS ---
+91.239.100.100   # UncensoredDNS-anycast
+89.233.43.71     # UncensoredDNS-unicast
+
+# --- NTT (formerly Verio) ---
+129.250.35.250   # NTT
+129.250.35.251   # NTT-secondary
+
+# --- Comcast Public ---
+75.75.75.75      # Comcast
+75.75.76.76      # Comcast-secondary
+
+# --- Cisco / OpenDNS Sandbox ---
+208.67.222.2     # OpenDNS-Sandbox
+208.67.220.2     # OpenDNS-Sandbox-secondary
+
+# --- Switch.ch (Switzerland) ---
+130.59.31.248    # Switch-ch
+130.59.31.251    # Switch-ch-secondary
+
+# --- puntCAT (Catalonia) ---
+109.69.8.51      # puntCAT
+
+# --- Digitale Gesellschaft (Switzerland) ---
+185.95.218.42    # DigitaleGesellschaft
+185.95.218.43    # DigitaleGesellschaft-secondary
+
+# --- LibreDNS (Greece) ---
+88.198.92.222    # LibreDNS
+
+# --- DNS.sb ---
+104.155.237.225  # DNS-SB-US
+
+# --- Applied Privacy (Austria) ---
+37.252.185.232   # AppliedPrivacy
+
+# --- Foundation for Applied Privacy ---
+146.255.56.98    # FoundationAppliedPrivacy
+
+# --- Nawala (Indonesia) ---
+180.131.144.144  # Nawala
+180.131.145.145  # Nawala-secondary
+
+# --- Rubyfish (China) ---
+115.159.157.26   # Rubyfish
+
+# --- TWNIC (Taiwan) ---
+101.101.101.101  # TWNIC
+101.102.103.104  # TWNIC-secondary
+
+# --- SkyDNS (Russia) ---
+193.58.251.251   # SkyDNS
+
+# --- Oszx/PumpMyDNS (UK) ---
+51.38.83.141     # PumpMyDNS
+
+# --- OpenNIC ---
+192.71.245.208   # OpenNIC-Fusl
+94.247.43.254    # OpenNIC-SE
+
+# --- Tiarap (Singapore) ---
+174.138.21.128   # Tiarap
+
+# --- AhaDNS ---
+5.2.75.75        # AhaDNS-Blitz

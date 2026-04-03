@@ -15,6 +15,34 @@ use std::time::Duration;
 use crate::cli::Cli;
 use crate::transport::BenchmarkConfig;
 
+/// GRC-compatible exit codes for automation and scripting.
+///
+/// 0 = success, 1 = file not found, 2 = no IPs in file,
+/// 3 = too many resolvers, 4 = no resolvers to test,
+/// 5 = no connectivity, 6 = lost connectivity during test,
+/// 7 = log file creation failure, 8 = log file write failure.
+fn error_to_exit_code(msg: &str) -> u8 {
+	if msg.contains("No such file") || msg.contains("not found") {
+		1
+	} else if msg.contains("no IPs") || msg.contains("No IPs") {
+		2
+	} else if msg.contains("too many") || msg.contains("Too many") {
+		3
+	} else if msg.contains("no resolvers") || msg.contains("No resolvers") {
+		4
+	} else if msg.contains("no connectivity") || msg.contains("No connectivity") {
+		5
+	} else if msg.contains("lost connectivity") || msg.contains("Lost connectivity") {
+		6
+	} else if msg.contains("create log") || msg.contains("Create log") {
+		7
+	} else if msg.contains("write log") || msg.contains("Write log") {
+		8
+	} else {
+		1
+	}
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
 	match run().await {
@@ -22,16 +50,7 @@ async fn main() -> ExitCode {
 		Err(e) => {
 			let msg = format!("{}", e);
 			eprintln!("Error: {}", msg);
-			// Map error messages to GRC-compatible exit codes
-			if msg.contains("No such file") || msg.contains("not found") {
-				ExitCode::from(1)
-			} else if msg.contains("no resolvers") || msg.contains("No resolvers") {
-				ExitCode::from(4)
-			} else if msg.contains("no connectivity") || msg.contains("No connectivity") {
-				ExitCode::from(5)
-			} else {
-				ExitCode::from(1)
-			}
+			ExitCode::from(error_to_exit_code(&msg))
 		}
 	}
 }
@@ -53,9 +72,28 @@ async fn run() -> anyhow::Result<()> {
 		resolvers.extend(resolver::read_resolver_file(path)?);
 	}
 
-	// When no resolvers explicitly specified, load the master list by default
-	if !user_specified {
+	// Scan mode: load ~11K public resolvers for massive-scale testing
+	if cli.scan {
+		let scan_list = resolver::scan_resolvers();
+		if scan_list.is_empty() {
+			anyhow::bail!("Scan list not found (resolvers/scan_us.txt). Cannot run --scan mode.");
+		}
+		println!("Scan mode: loading {} public resolvers for massive-scale test", scan_list.len());
+		resolvers.extend(scan_list);
+	}
+
+	// When no resolvers explicitly specified (and not scanning), load the master lists by default
+	if !user_specified && !cli.scan {
 		resolvers.extend(resolver::default_resolvers());
+		if !cli.no_ipv6_resolvers {
+			resolvers.extend(resolver::default_ipv6_resolvers());
+		}
+		if !cli.no_doh_resolvers {
+			resolvers.extend(resolver::default_doh_resolvers());
+		}
+		if !cli.no_dot_resolvers {
+			resolvers.extend(resolver::default_dot_resolvers());
+		}
 	}
 
 	// System resolvers (included by default, opt out with --no-system-resolvers)
@@ -88,17 +126,32 @@ async fn run() -> anyhow::Result<()> {
 		Some(path) => domains::read_domain_file(path)?,
 		None => domains::default_tld_domains(),
 	};
+	let dotcom_domains = match &cli.dotcom_domains {
+		Some(path) => domains::read_domain_file(path)?,
+		None => domains::default_dotcom_domains(),
+	};
+	let dnssec_domains = match &cli.dnssec_domains {
+		Some(path) => domains::read_domain_file(path)?,
+		None => domains::default_dnssec_domains(),
+	};
 
 	// Build benchmark config
 	let query_tld = !cli.no_tld;
 	// Auto-enable discovery when resolver list is large (>20) unless disabled
-	let discover = if cli.no_discover {
+	// Scan mode always forces discovery on
+	let discover = if cli.scan {
+		true
+	} else if cli.no_discover {
 		false
 	} else {
 		cli.discover || resolvers.len() > 20
 	};
+	// Scan mode overrides rounds to 30 for thorough testing
+	let rounds = if cli.scan { 30 } else { cli.rounds };
+	let query_dotcom = !cli.no_dotcom;
+	let query_dnssec_domains = cli.dnssec;
 	let config = BenchmarkConfig {
-		rounds: cli.rounds,
+		rounds,
 		timeout: Duration::from_millis(cli.timeout),
 		max_inflight: cli.concurrency,
 		inter_query_spacing: Duration::from_millis(cli.spacing),
@@ -113,12 +166,20 @@ async fn run() -> anyhow::Result<()> {
 		pin_system: !cli.no_pin_system,
 		sideline: !cli.no_sideline,
 		sideline_ms: cli.sideline_ms as f64,
+		query_dotcom,
+		char_timeout: Duration::from_millis(cli.char_timeout),
+		char_attempts: cli.char_attempts,
+		query_dnssec_domains,
 	};
+
+	// Track resolver counts through the pipeline
+	let initial_count = resolvers.len();
 
 	// Print configuration summary
 	output::print_config_summary(
 		&resolvers, warm_domains.len(), cold_domains.len(),
-		tld_domains.len(), &config,
+		tld_domains.len(), dotcom_domains.len(),
+		dnssec_domains.len(), &config,
 	);
 
 	// Build DoH client pool for any DoH resolvers
@@ -133,15 +194,19 @@ async fn run() -> anyhow::Result<()> {
 		println!();
 	}
 
+	let post_discovery_count = resolvers.len();
+
 	// Run reverse DNS (PTR) lookups and NXDOMAIN interception characterization
 	rdns::resolve_ptr_names(&mut resolvers, config.timeout).await;
-	bench::run_characterization(&mut resolvers, config.timeout, &nxdomain_domains).await;
+	bench::run_characterization(&mut resolvers, &config, &nxdomain_domains).await;
+
+	let post_char_count = resolvers.len();
 
 	// Run benchmark
 	println!("Running benchmark...");
 	let mut results = bench::run_benchmark(
-		&resolvers, &warm_domains, &cold_domains, &tld_domains, &config,
-		&doh_clients,
+		&resolvers, &warm_domains, &cold_domains, &tld_domains,
+		&dotcom_domains, &dnssec_domains, &config, &doh_clients,
 	).await?;
 
 	// Filter out resolvers with <50% success rate (too noisy to report)
@@ -182,13 +247,19 @@ async fn run() -> anyhow::Result<()> {
 		r.tie_group = None;
 	}
 
+	// Print pipeline summary
+	let final_count = results.len();
+	output::print_pipeline_summary(
+		initial_count, post_discovery_count, post_char_count, final_count,
+	);
+
 	// Print results table and conclusions
-	output::print_results_table(&results, config.query_tld);
+	output::print_results_table(&results, config.query_tld, config.query_dotcom, config.query_dnssec_domains);
 	output::print_conclusions(&results);
 
 	// Write CSV if requested
 	if let Some(path) = &cli.output {
-		output::write_csv(path, &results, config.query_tld)?;
+		output::write_csv(path, &results, config.query_tld, config.query_dotcom, config.query_dnssec_domains)?;
 	}
 
 	// Save resolver list if requested
