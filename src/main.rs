@@ -154,6 +154,7 @@ async fn run() -> anyhow::Result<()> {
 		dnssec: DEFAULT_DNSSEC,
 		discover,
 		top_n: DEFAULT_TOP_N,
+		exhaustive: cli.exhaustive,
 		max_resolver_ms: DEFAULT_MAX_RESOLVER_MS,
 		sort_mode,
 		telemetry: telemetry::TelemetryLog::new(true),

@@ -8,6 +8,7 @@
 - Added resolver deduplication by IP address after all sources are loaded, fixing count mismatch between CSV download and displayed total
 
 ### Behavior or Interface Changes
+- Exhaustive mode now skips discovery Phase 2 (top-N cut), keeping all reachable resolvers for the full benchmark instead of hard-cutting to top 50
 - Applied CLI argument minimalism round 2: reduced from 14 flags to 7. Removed `--scan`, `--aaaa`, `--dnssec`, `--seed`, `--no-system-resolvers`, `--sort`, `--query-domains`. Moved removed settings to compile-time constants in `src/transport.rs`
 - AAAA queries and DNSSEC are now always enabled (hardcoded on)
 - System resolvers from /etc/resolv.conf are now always included

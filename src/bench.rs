@@ -633,6 +633,13 @@ pub async fn run_discovery(
 		survivors.len(), resolvers.len(), unreachable,
 	);
 
+	if config.exhaustive {
+		println!("  Exhaustive mode: keeping all {} reachable resolvers (no top-N cut)", survivors.len());
+		config.telemetry.log_pipeline("discovery_reachable", survivors.len());
+		config.telemetry.log_pipeline("discovery_top_n", survivors.len());
+		return Ok(survivors);
+	}
+
 	if survivors.len() <= top_n {
 		println!("  Keeping all {} survivors (at or below --top {})", survivors.len(), top_n);
 		config.telemetry.log_pipeline("discovery_reachable", survivors.len());

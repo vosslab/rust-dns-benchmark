@@ -88,7 +88,11 @@ pub fn print_config_summary(
 	let dnssec_label = if config.dnssec { "yes" } else { "no" };
 	println!("  DNSSEC (DO):  {}", dnssec_label);
 	if config.discover {
-		println!("  Discovery:    top {}", config.top_n);
+		if config.exhaustive {
+			println!("  Discovery:    reachability only");
+		} else {
+			println!("  Discovery:    top {}", config.top_n);
+		}
 	}
 	let sort_label = match &config.sort_mode {
 		crate::stats::SortMode::Score => "overall score".to_string(),

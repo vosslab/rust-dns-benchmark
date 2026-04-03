@@ -109,6 +109,8 @@ pub struct BenchmarkConfig {
 	pub discover: bool,
 	/// Number of top resolvers to keep in discovery mode
 	pub top_n: usize,
+	/// Exhaustive mode: skip discovery Phase 2 (top-N cut)
+	pub exhaustive: bool,
 	/// Maximum resolver latency in ms; resolvers above this are dropped from results
 	pub max_resolver_ms: f64,
 	/// Sort mode for ranking results
