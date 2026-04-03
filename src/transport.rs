@@ -13,6 +13,11 @@ pub const DEFAULT_MAX_RESOLVER_MS: f64 = 1000.0;
 pub const DEFAULT_SIDELINE_MS: f64 = 500.0;
 pub const DEFAULT_CHAR_TIMEOUT_MS: u64 = 50;
 pub const DEFAULT_CHAR_ATTEMPTS: u32 = 10;
+pub const DEFAULT_QUERY_AAAA: bool = true;
+pub const DEFAULT_DNSSEC: bool = true;
+pub const DEFAULT_INCLUDE_SYSTEM_RESOLVERS: bool = true;
+pub const DEFAULT_SORT: &str = "score";
+pub const DEFAULT_EXHAUSTIVE_ROUNDS: u32 = 30;
 
 /// DNS transport protocol
 #[derive(Debug, Clone, PartialEq, Eq)]

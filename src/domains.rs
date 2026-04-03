@@ -34,19 +34,6 @@ pub fn load_default_query_domains() -> BTreeMap<String, Vec<String>> {
 	parse_query_domains_csv(DEFAULT_QUERY_DOMAINS_CSV)
 }
 
-/// Load query domains from a user-provided CSV file.
-///
-/// Same format as the default: domain,category with header row.
-pub fn load_query_domains_file(path: &str) -> Result<BTreeMap<String, Vec<String>>> {
-	let content = std::fs::read_to_string(path)
-		.map_err(|e| anyhow!("failed to read query domains file '{}': {}", path, e))?;
-	let categories = parse_query_domains_csv(&content);
-	if categories.is_empty() {
-		return Err(anyhow!("no valid domains found in '{}'", path));
-	}
-	Ok(categories)
-}
-
 /// Return a list of domains guaranteed not to exist.
 ///
 /// Used for NXDOMAIN interception detection. These use the .invalid TLD
@@ -65,19 +52,6 @@ pub fn default_nxdomain_domains() -> Vec<String> {
 		"benchmark-interception-test.invalid",
 		"nxdomain-validation-probe.invalid",
 	].into_iter().map(String::from).collect()
-}
-
-/// Read domains from a file, one per line.
-///
-/// Blank lines and lines starting with '#' are skipped.
-pub fn read_domain_file(path: &str) -> Result<Vec<String>> {
-	let content = std::fs::read_to_string(path)
-		.map_err(|e| anyhow!("failed to read domain file '{}': {}", path, e))?;
-	let domains: Vec<String> = content.lines()
-		.map(|line| line.trim().to_string())
-		.filter(|line| !line.is_empty() && !line.starts_with('#'))
-		.collect();
-	Ok(domains)
 }
 
 #[cfg(test)]

@@ -15,7 +15,9 @@ use std::time::Duration;
 
 use crate::cli::Cli;
 use crate::transport::{BenchmarkConfig, DEFAULT_TIMEOUT_MS, DEFAULT_CONCURRENCY,
-	DEFAULT_SPACING_MS, DEFAULT_TOP_N, DEFAULT_MAX_RESOLVER_MS};
+	DEFAULT_SPACING_MS, DEFAULT_TOP_N, DEFAULT_MAX_RESOLVER_MS,
+	DEFAULT_QUERY_AAAA, DEFAULT_DNSSEC, DEFAULT_INCLUDE_SYSTEM_RESOLVERS,
+	DEFAULT_SORT, DEFAULT_EXHAUSTIVE_ROUNDS};
 
 /// GRC-compatible exit codes for automation and scripting.
 ///
@@ -99,16 +101,6 @@ async fn run() -> anyhow::Result<()> {
 		}
 	}
 
-	// Scan mode: load ~11K US public resolvers for massive-scale testing
-	if cli.scan && !cli.exhaustive {
-		let scan_list = resolver::scan_resolvers();
-		if scan_list.is_empty() {
-			anyhow::bail!("Scan list not found (resolvers/scan_us.txt). Cannot run --scan mode.");
-		}
-		println!("Scan mode: loading {} US public resolvers for massive-scale test", scan_list.len());
-		resolvers.extend(scan_list);
-	}
-
 	// Load built-in resolver lists (always, unless user specified explicit resolvers)
 	if !user_specified {
 		resolvers.extend(resolver::default_resolvers());
@@ -117,8 +109,8 @@ async fn run() -> anyhow::Result<()> {
 		resolvers.extend(resolver::default_dot_resolvers());
 	}
 
-	// System resolvers (included by default, opt out with --no-system-resolvers)
-	if !cli.no_system_resolvers {
+	// System resolvers (compile-time default: always included)
+	if DEFAULT_INCLUDE_SYSTEM_RESOLVERS {
 		let mut sys = resolver::system_resolvers();
 		// Deduplicate: skip system resolvers already in the list
 		sys.retain(|s| !resolvers.iter().any(|r| r.addr.ip() == s.addr.ip()));
@@ -134,49 +126,32 @@ async fn run() -> anyhow::Result<()> {
 		anyhow::bail!("No resolvers to test. Provide resolvers via -r, -f, or system defaults.");
 	}
 
-	// Load query domain categories (from file or built-in defaults)
-	let mut categories = match &cli.query_domains {
-		Some(path) => domains::load_query_domains_file(path)?,
-		None => domains::load_default_query_domains(),
-	};
+	// Load query domain categories from built-in defaults
+	let mut categories = domains::load_default_query_domains();
 
-	// Only include DNSSEC category when --dnssec is enabled
-	if !cli.dnssec {
+	// Remove DNSSEC category if DNSSEC is disabled at compile time
+	if !DEFAULT_DNSSEC {
 		categories.remove("dnssec");
 	}
 
 	// Load NXDOMAIN test domains (used for characterization, not benchmarking)
 	let nxdomain_domains = domains::default_nxdomain_domains();
 
-	// Parse sort mode and validate against loaded categories
-	let sort_mode = stats::parse_sort_mode(&cli.sort);
-	if let stats::SortMode::Category(ref name) = sort_mode {
-		if !categories.contains_key(name) {
-			let valid: Vec<&str> = categories.keys().map(|s| s.as_str()).collect();
-			anyhow::bail!(
-				"Unknown sort category '{}'. Valid categories: score, name, {}",
-				name, valid.join(", ")
-			);
-		}
-	}
+	// Sort mode (compile-time default)
+	let sort_mode = stats::parse_sort_mode(DEFAULT_SORT);
 
 	// Auto-enable discovery when resolver list is large (>20)
-	// Scan and exhaustive modes always force discovery on
-	let discover = if cli.scan || cli.exhaustive {
-		true
-	} else {
-		resolvers.len() > 20
-	};
-	// Scan/exhaustive modes override rounds to 30 for thorough testing
-	let rounds = if cli.scan || cli.exhaustive { 30 } else { cli.rounds };
+	let discover = cli.exhaustive || resolvers.len() > 20;
+	// Exhaustive mode overrides rounds for thorough testing
+	let rounds = if cli.exhaustive { DEFAULT_EXHAUSTIVE_ROUNDS } else { cli.rounds };
 	let config = BenchmarkConfig {
 		rounds,
 		timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
 		max_inflight: DEFAULT_CONCURRENCY,
 		inter_query_spacing: Duration::from_millis(DEFAULT_SPACING_MS),
-		query_aaaa: cli.aaaa,
-		seed: cli.seed,
-		dnssec: cli.dnssec,
+		query_aaaa: DEFAULT_QUERY_AAAA,
+		seed: None,
+		dnssec: DEFAULT_DNSSEC,
 		discover,
 		top_n: DEFAULT_TOP_N,
 		max_resolver_ms: DEFAULT_MAX_RESOLVER_MS,
@@ -185,7 +160,7 @@ async fn run() -> anyhow::Result<()> {
 	};
 
 	// Determine run mode for telemetry
-	let mode = if cli.exhaustive { "exhaustive" } else if cli.scan { "scan" } else { "default" };
+	let mode = if cli.exhaustive { "exhaustive" } else { "default" };
 	config.telemetry.log_config(rounds, DEFAULT_TOP_N, DEFAULT_SPACING_MS, mode, resolvers.len());
 
 	// Track resolver counts through the pipeline

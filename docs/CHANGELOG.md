@@ -4,18 +4,20 @@
 
 ### Additions and New Features
 - Added `query_domains.csv` with data-driven domain categories (cached, uncached, tld, dotcom, dnssec) replacing hardcoded per-category functions
-- Added `--query-domains` / `-p` flag to load custom query domain CSV file
 - Added `--no-test` flag to print config summary and exit without running benchmark (useful with `--exhaustive` to verify resolver loading)
 - Added resolver deduplication by IP address after all sources are loaded, fixing count mismatch between CSV download and displayed total
 
 ### Behavior or Interface Changes
+- Applied CLI argument minimalism round 2: reduced from 14 flags to 7. Removed `--scan`, `--aaaa`, `--dnssec`, `--seed`, `--no-system-resolvers`, `--sort`, `--query-domains`. Moved removed settings to compile-time constants in `src/transport.rs`
+- AAAA queries and DNSSEC are now always enabled (hardcoded on)
+- System resolvers from /etc/resolv.conf are now always included
+- Sort order hardcoded to "score"
+- `--scan` mode removed; `--exhaustive` subsumes it
 - Restructured config display into three clear sections: "Resolvers under test", "Query domains", and "Timing and options"
 - Renamed domain categories from warm/cold to cached/uncached for clarity
 - Results table columns are now dynamic based on loaded categories instead of hardcoded warm/cold/tld/dotcom/dnssec
 - CSV output columns are now dynamic based on loaded categories
 - Overall score now averages all categories with data instead of hardcoded warm+cold+dotcom formula
-- `--sort` flag now accepts any category name (e.g. `--sort cached`, `--sort tld`) instead of fixed enum values
-- DNSSEC query domain category only loaded when `--dnssec` flag is used (previously controlled by separate internal flag)
 - Removed `query_dnssec_domains` field from `BenchmarkConfig`
 - Replaced 20-field `ResolverAggregation` struct with generic `BTreeMap<String, CategoryAgg>`
 - Replaced per-category fields in `ResolverStats` with `BTreeMap<String, SetStats>`

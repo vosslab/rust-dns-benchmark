@@ -346,11 +346,6 @@ pub fn default_dot_resolvers() -> Vec<ResolverConfig> {
 	find_resolver_file("resolvers_dot.txt").unwrap_or_default()
 }
 
-/// Return the large scan list from scan_us.txt (~11K US public resolvers).
-pub fn scan_resolvers() -> Vec<ResolverConfig> {
-	find_resolver_file("scan_us.txt").unwrap_or_default()
-}
-
 /// Return the global scan list from scan_global.txt (~63K worldwide public resolvers).
 pub fn scan_global_resolvers() -> Vec<ResolverConfig> {
 	find_resolver_file("scan_global.txt").unwrap_or_default()

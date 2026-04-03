@@ -17,14 +17,6 @@ pub struct Cli {
 	#[arg(short = 'n', long = "rounds", default_value = "3")]
 	pub rounds: u32,
 
-	/// Also query AAAA records
-	#[arg(long = "aaaa")]
-	pub aaaa: bool,
-
-	/// Enable DNSSEC (set DO bit on all queries)
-	#[arg(long = "dnssec")]
-	pub dnssec: bool,
-
 	/// Output CSV file path
 	#[arg(short = 'o', long = "output")]
 	pub output: Option<String>,
@@ -33,29 +25,9 @@ pub struct Cli {
 	#[arg(long = "save-resolvers")]
 	pub save_resolvers: Option<String>,
 
-	/// Random seed for reproducible results
-	#[arg(short = 's', long = "seed")]
-	pub seed: Option<u64>,
-
-	/// Exclude system resolvers from /etc/resolv.conf (included by default)
-	#[arg(long = "no-system-resolvers")]
-	pub no_system_resolvers: bool,
-
-	/// Sort order for results (score, name, or any category name like cached, tld)
-	#[arg(long = "sort", default_value = "score")]
-	pub sort: String,
-
-	/// Massive-scale scan: load ~11K public resolvers, discover survivors, benchmark with 30 rounds
-	#[arg(long = "scan")]
-	pub scan: bool,
-
-	/// Exhaustive test: load ALL resolver lists (built-in + US scan + global), discover survivors, benchmark thoroughly
+	/// Exhaustive test: load ALL resolver lists (built-in + global), discover survivors, benchmark thoroughly
 	#[arg(long = "exhaustive")]
 	pub exhaustive: bool,
-
-	/// Custom query domains CSV file (domain,category format)
-	#[arg(short = 'p', long = "query-domains")]
-	pub query_domains: Option<String>,
 
 	/// Print config summary and exit without running benchmark
 	#[arg(long = "no-test")]
