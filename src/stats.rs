@@ -1,3 +1,21 @@
+use clap::ValueEnum;
+
+/// Sort mode for ranking resolvers
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum SortMode {
+	/// Sort by overall composite score (default)
+	#[default]
+	Score,
+	/// Sort by warm (cached) p50 latency
+	Warm,
+	/// Sort by cold (uncached) p50 latency
+	Cold,
+	/// Sort by TLD p50 latency
+	Tld,
+	/// Sort alphabetically by resolver name
+	Name,
+}
+
 /// Statistics for a set of queries (warm, cold, or tld)
 #[derive(Debug, Clone, Default)]
 pub struct SetStats {
@@ -16,12 +34,21 @@ pub struct SetStats {
 pub struct ResolverStats {
 	pub label: String,
 	pub addr: String,
+	/// Transport protocol label ("UDP", "DoT", "DoH")
+	pub transport: String,
 	pub warm: SetStats,
 	pub cold: SetStats,
 	pub tld: Option<SetStats>,
 	pub overall_score: f64,
 	pub success_rate: f64,
 	pub intercepts_nxdomain: bool,
+	pub is_system: bool,
+	/// Reverse DNS (PTR) hostname for resolver IP
+	pub ptr_name: Option<String>,
+	/// Whether the resolver has DNS rebinding protection
+	pub rebinding_protection: Option<bool>,
+	/// Whether the resolver validates DNSSEC
+	pub validates_dnssec: Option<bool>,
 }
 
 /// Scored and ranked resolver
@@ -29,6 +56,8 @@ pub struct ResolverStats {
 pub struct ScoredResolver {
 	pub rank: usize,
 	pub stats: ResolverStats,
+	/// Whether this resolver is a system resolver (for pinning)
+	pub is_system: bool,
 	/// Tie group label (e.g. "1-3") when resolvers are statistically tied
 	pub tie_group: Option<String>,
 }
@@ -82,6 +111,10 @@ pub fn stddev(values: &[f64]) -> Option<f64> {
 /// - 0.5 * (p95 - p50): half-weighted tail penalty to penalize inconsistent resolvers
 /// - penalty_ms * timeout_rate: reliability penalty using full timeout as the cost
 pub fn set_score(stats: &SetStats, timeout_penalty_ms: f64) -> f64 {
+	// Dead resolvers (no successful queries) get infinite score so they sort last
+	if stats.success_count == 0 {
+		return f64::INFINITY;
+	}
 	let timeout_rate = if stats.total_count > 0 {
 		stats.timeout_count as f64 / stats.total_count as f64
 	} else {
@@ -158,10 +191,7 @@ pub fn detect_ties(resolvers: &mut [ScoredResolver], uncertainties: &[f64]) {
 
 	// Build tie groups using a union-find approach on consecutive pairs
 	let n = resolvers.len();
-	let mut group_id = vec![0usize; n];
-	for i in 0..n {
-		group_id[i] = i;
-	}
+	let mut group_id: Vec<usize> = (0..n).collect();
 
 	// Check consecutive pairs for overlap
 	for i in 0..(n - 1) {
@@ -203,21 +233,45 @@ pub fn detect_ties(resolvers: &mut [ScoredResolver], uncertainties: &[f64]) {
 	}
 }
 
-/// Rank resolvers by overall score (average of warm and cold scores), ascending.
+/// Rank resolvers by the chosen sort mode, ascending.
 ///
-/// Lower scores are better (lower latency).
-pub fn rank_resolvers(mut resolvers: Vec<ResolverStats>) -> Vec<ScoredResolver> {
-	// Sort by overall score ascending (lower is better)
-	resolvers.sort_by(|a, b| {
-		a.overall_score.partial_cmp(&b.overall_score)
-			.unwrap_or(std::cmp::Ordering::Equal)
-	});
+/// Lower scores/latencies are better for all numeric modes.
+pub fn rank_resolvers(mut resolvers: Vec<ResolverStats>, sort_mode: SortMode) -> Vec<ScoredResolver> {
+	let cmp_f64 = |a: f64, b: f64| -> std::cmp::Ordering {
+		a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
+	};
+	match sort_mode {
+		SortMode::Score => {
+			resolvers.sort_by(|a, b| cmp_f64(a.overall_score, b.overall_score));
+		}
+		SortMode::Warm => {
+			resolvers.sort_by(|a, b| cmp_f64(a.warm.p50_ms, b.warm.p50_ms));
+		}
+		SortMode::Cold => {
+			resolvers.sort_by(|a, b| cmp_f64(a.cold.p50_ms, b.cold.p50_ms));
+		}
+		SortMode::Tld => {
+			// Resolvers without TLD data sort to the end
+			resolvers.sort_by(|a, b| {
+				let a_val = a.tld.as_ref().map(|t| t.p50_ms).unwrap_or(f64::MAX);
+				let b_val = b.tld.as_ref().map(|t| t.p50_ms).unwrap_or(f64::MAX);
+				cmp_f64(a_val, b_val)
+			});
+		}
+		SortMode::Name => {
+			resolvers.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+		}
+	}
 	resolvers.into_iter()
 		.enumerate()
-		.map(|(i, stats)| ScoredResolver {
-			rank: i + 1,
-			stats,
-			tie_group: None,
+		.map(|(i, stats)| {
+			let is_system = stats.is_system;
+			ScoredResolver {
+				rank: i + 1,
+				stats,
+				is_system,
+				tie_group: None,
+			}
 		})
 		.collect()
 }
@@ -301,35 +355,50 @@ mod tests {
 			ResolverStats {
 				label: "slow".to_string(),
 				addr: "0.0.0.0".to_string(),
+				transport: "UDP".to_string(),
 				warm: SetStats::default(),
 				cold: SetStats::default(),
 				tld: None,
 				overall_score: 100.0,
 				success_rate: 95.0,
 				intercepts_nxdomain: false,
+				is_system: false,
+				ptr_name: None,
+				rebinding_protection: None,
+				validates_dnssec: None,
 			},
 			ResolverStats {
 				label: "fast".to_string(),
 				addr: "0.0.0.0".to_string(),
+				transport: "UDP".to_string(),
 				warm: SetStats::default(),
 				cold: SetStats::default(),
 				tld: None,
 				overall_score: 10.0,
 				success_rate: 99.0,
 				intercepts_nxdomain: false,
+				is_system: false,
+				ptr_name: None,
+				rebinding_protection: None,
+				validates_dnssec: None,
 			},
 			ResolverStats {
 				label: "medium".to_string(),
 				addr: "0.0.0.0".to_string(),
+				transport: "UDP".to_string(),
 				warm: SetStats::default(),
 				cold: SetStats::default(),
 				tld: None,
 				overall_score: 50.0,
 				success_rate: 97.0,
 				intercepts_nxdomain: false,
+				is_system: false,
+				ptr_name: None,
+				rebinding_protection: None,
+				validates_dnssec: None,
 			},
 		];
-		let ranked = rank_resolvers(resolvers);
+		let ranked = rank_resolvers(resolvers, SortMode::Score);
 		assert_eq!(ranked[0].rank, 1);
 		assert_eq!(ranked[0].stats.label, "fast");
 		assert_eq!(ranked[1].rank, 2);
@@ -368,13 +437,19 @@ mod tests {
 				stats: ResolverStats {
 					label: "a".to_string(),
 					addr: "0.0.0.0".to_string(),
+					transport: "UDP".to_string(),
 					warm: SetStats::default(),
 					cold: SetStats::default(),
 					tld: None,
 					overall_score: 10.0,
 					success_rate: 99.0,
 					intercepts_nxdomain: false,
+					is_system: false,
+					ptr_name: None,
+					rebinding_protection: None,
+					validates_dnssec: None,
 				},
+				is_system: false,
 				tie_group: None,
 			},
 			ScoredResolver {
@@ -382,13 +457,19 @@ mod tests {
 				stats: ResolverStats {
 					label: "b".to_string(),
 					addr: "0.0.0.0".to_string(),
+					transport: "UDP".to_string(),
 					warm: SetStats::default(),
 					cold: SetStats::default(),
 					tld: None,
 					overall_score: 11.0,
 					success_rate: 98.0,
 					intercepts_nxdomain: false,
+					is_system: false,
+					ptr_name: None,
+					rebinding_protection: None,
+					validates_dnssec: None,
 				},
+				is_system: false,
 				tie_group: None,
 			},
 			ScoredResolver {
@@ -396,13 +477,19 @@ mod tests {
 				stats: ResolverStats {
 					label: "c".to_string(),
 					addr: "0.0.0.0".to_string(),
+					transport: "UDP".to_string(),
 					warm: SetStats::default(),
 					cold: SetStats::default(),
 					tld: None,
 					overall_score: 50.0,
 					success_rate: 95.0,
 					intercepts_nxdomain: false,
+					is_system: false,
+					ptr_name: None,
+					rebinding_protection: None,
+					validates_dnssec: None,
 				},
+				is_system: false,
 				tie_group: None,
 			},
 		];
@@ -425,13 +512,19 @@ mod tests {
 				stats: ResolverStats {
 					label: "a".to_string(),
 					addr: "0.0.0.0".to_string(),
+					transport: "UDP".to_string(),
 					warm: SetStats::default(),
 					cold: SetStats::default(),
 					tld: None,
 					overall_score: 10.0,
 					success_rate: 99.0,
 					intercepts_nxdomain: false,
+					is_system: false,
+					ptr_name: None,
+					rebinding_protection: None,
+					validates_dnssec: None,
 				},
+				is_system: false,
 				tie_group: None,
 			},
 			ScoredResolver {
@@ -439,13 +532,19 @@ mod tests {
 				stats: ResolverStats {
 					label: "b".to_string(),
 					addr: "0.0.0.0".to_string(),
+					transport: "UDP".to_string(),
 					warm: SetStats::default(),
 					cold: SetStats::default(),
 					tld: None,
 					overall_score: 100.0,
 					success_rate: 95.0,
 					intercepts_nxdomain: false,
+					is_system: false,
+					ptr_name: None,
+					rebinding_protection: None,
+					validates_dnssec: None,
 				},
+				is_system: false,
 				tie_group: None,
 			},
 		];

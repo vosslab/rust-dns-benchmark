@@ -2,59 +2,169 @@ use std::net::SocketAddr;
 
 use anyhow::{anyhow, Result};
 
-use crate::transport::ResolverConfig;
+use crate::transport::{DnsTransport, ResolverConfig};
 
 /// Parse a resolver address string into a ResolverConfig.
 ///
 /// Supports formats:
-///   "1.1.1.1"              -- IPv4, default port 53
-///   "1.1.1.1:53"           -- IPv4 with explicit port
-///   "2606:4700::1111"      -- bare IPv6, default port 53
-///   "[2606:4700::1111]:53" -- bracketed IPv6 with port
+///   "1.1.1.1"                           -- UDP, default port 53
+///   "1.1.1.1:53"                        -- UDP with explicit port
+///   "2606:4700::1111"                   -- UDP, bare IPv6, default port 53
+///   "[2606:4700::1111]:53"              -- UDP, bracketed IPv6 with port
+///   "tls://1.1.1.1"                     -- DoT, default port 853
+///   "tls://1.1.1.1:853"                -- DoT with explicit port
+///   "tls://dns.google/8.8.8.8"         -- DoT with SNI hostname
+///   "https://1.1.1.1/dns-query"        -- DoH
+///   "https://dns.google/dns-query"     -- DoH with hostname
 pub fn parse_resolver(input: &str) -> Result<ResolverConfig> {
 	let trimmed = input.trim();
 	if trimmed.is_empty() {
 		return Err(anyhow!("empty resolver address"));
 	}
 
-	let addr: SocketAddr = if trimmed.starts_with('[') {
+	// Detect transport scheme
+	if trimmed.starts_with("https://") {
+		return parse_doh_resolver(trimmed);
+	}
+	if trimmed.starts_with("tls://") {
+		return parse_dot_resolver(trimmed);
+	}
+
+	// Plain UDP resolver
+	let addr = parse_socket_addr(trimmed, 53)?;
+	let label = format!("{}", addr.ip());
+	Ok(ResolverConfig {
+		label, addr,
+		transport: DnsTransport::Udp,
+		intercepts_nxdomain: false, is_system: false,
+		ptr_name: None, rebinding_protection: None, validates_dnssec: None,
+	})
+}
+
+/// Parse a DoH resolver URL like "https://1.1.1.1/dns-query"
+fn parse_doh_resolver(url: &str) -> Result<ResolverConfig> {
+	// Strip scheme to extract host and path
+	let after_scheme = &url["https://".len()..];
+
+	// Extract host portion (before first '/')
+	let (host_port, _path) = match after_scheme.find('/') {
+		Some(i) => (&after_scheme[..i], &after_scheme[i..]),
+		None => (after_scheme, "/dns-query"),
+	};
+
+	// Parse the host as an IP address for the addr field
+	let addr = parse_host_to_addr(host_port, 443)?;
+	let label = host_port.to_string();
+
+	Ok(ResolverConfig {
+		label, addr,
+		transport: DnsTransport::Doh { url: url.to_string() },
+		intercepts_nxdomain: false, is_system: false,
+		ptr_name: None, rebinding_protection: None, validates_dnssec: None,
+	})
+}
+
+/// Parse a DoT resolver like "tls://1.1.1.1" or "tls://dns.google/8.8.8.8"
+fn parse_dot_resolver(input: &str) -> Result<ResolverConfig> {
+	let after_scheme = &input["tls://".len()..];
+
+	// Check for "hostname/IP" format for SNI + IP separation
+	let (hostname, addr) = if let Some(slash_idx) = after_scheme.find('/') {
+		let hostname = &after_scheme[..slash_idx];
+		let ip_part = &after_scheme[slash_idx + 1..];
+		let addr = parse_socket_addr(ip_part, 853)?;
+		(hostname.to_string(), addr)
+	} else {
+		// Just an IP address, use IP as both addr and hostname
+		let addr = parse_socket_addr(after_scheme, 853)?;
+		let hostname = after_scheme.split(':').next().unwrap_or(after_scheme);
+		(hostname.to_string(), addr)
+	};
+
+	let label = hostname.clone();
+	Ok(ResolverConfig {
+		label, addr,
+		transport: DnsTransport::Dot { hostname },
+		intercepts_nxdomain: false, is_system: false,
+		ptr_name: None, rebinding_protection: None, validates_dnssec: None,
+	})
+}
+
+/// Parse a host:port string to a SocketAddr, supporting IPv4, IPv6, and hostnames.
+///
+/// For hostnames that cannot be parsed as IPs, attempts DNS resolution.
+fn parse_host_to_addr(host_port: &str, default_port: u16) -> Result<SocketAddr> {
+	// Handle bracketed IPv6: [::1]:443
+	if host_port.starts_with('[') {
+		let addr: SocketAddr = host_port.parse()
+			.map_err(|e| anyhow!("invalid bracketed address '{}': {}", host_port, e))?;
+		return Ok(addr);
+	}
+
+	// Try as IP:port or plain IP
+	if let Ok(addr) = host_port.parse::<SocketAddr>() {
+		return Ok(addr);
+	}
+	if let Ok(ip) = host_port.parse::<std::net::IpAddr>() {
+		return Ok(SocketAddr::new(ip, default_port));
+	}
+
+	// Split off port if present (hostname:port)
+	let (host, port) = if let Some(colon_idx) = host_port.rfind(':') {
+		let port_str = &host_port[colon_idx + 1..];
+		if let Ok(port) = port_str.parse::<u16>() {
+			(&host_port[..colon_idx], port)
+		} else {
+			(host_port, default_port)
+		}
+	} else {
+		(host_port, default_port)
+	};
+
+	// Try DNS resolution for hostnames
+	use std::net::ToSocketAddrs;
+	let addr_str = format!("{}:{}", host, port);
+	let addr = addr_str.to_socket_addrs()
+		.map_err(|e| anyhow!("cannot resolve hostname '{}': {}", host, e))?
+		.next()
+		.ok_or_else(|| anyhow!("no addresses found for hostname '{}'", host))?;
+	Ok(addr)
+}
+
+/// Parse a plain socket address string with a default port.
+fn parse_socket_addr(input: &str, default_port: u16) -> Result<SocketAddr> {
+	let trimmed = input.trim();
+
+	if trimmed.starts_with('[') {
 		// Bracketed IPv6 with port: [::1]:53
-		trimmed.parse()
-			.map_err(|e| anyhow!("invalid bracketed IPv6 address '{}': {}", trimmed, e))?
+		let addr: SocketAddr = trimmed.parse()
+			.map_err(|e| anyhow!("invalid bracketed IPv6 address '{}': {}", trimmed, e))?;
+		Ok(addr)
 	} else if trimmed.contains("::") || trimmed.matches(':').count() > 1 {
 		// Bare IPv6 address without port
 		let ip = trimmed.parse()
 			.map_err(|e| anyhow!("invalid IPv6 address '{}': {}", trimmed, e))?;
-		SocketAddr::new(ip, 53)
+		Ok(SocketAddr::new(ip, default_port))
 	} else if let Ok(addr) = trimmed.parse::<SocketAddr>() {
-		// IPv4 with port (e.g. "8.8.8.8:5353")
-		addr
+		// IPv4 with port
+		Ok(addr)
 	} else {
 		// Plain IPv4 without port
 		let ip = trimmed.parse()
 			.map_err(|e| anyhow!("invalid IP address '{}': {}", trimmed, e))?;
-		SocketAddr::new(ip, 53)
-	};
-
-	let label = format!("{}", addr.ip());
-	Ok(ResolverConfig { label, addr, intercepts_nxdomain: false })
+		Ok(SocketAddr::new(ip, default_port))
+	}
 }
 
 /// Parse a resolver line that may contain an inline comment label.
 ///
-/// Format: "IP_ADDRESS  # Label"
+/// Format: "IP_ADDRESS  # Label" or "https://url  # Label"
 /// The label after '#' becomes the resolver's display name.
 fn parse_resolver_line(line: &str) -> Result<ResolverConfig> {
 	let trimmed = line.trim();
 
-	// Split on '#' to extract optional label
-	let (addr_part, label_part) = if let Some(idx) = trimmed.find('#') {
-		let addr = trimmed[..idx].trim();
-		let label = trimmed[idx + 1..].trim();
-		(addr, Some(label))
-	} else {
-		(trimmed, None)
-	};
+	// Split address and label, handling scheme-prefixed URLs
+	let (addr_part, label_part) = split_addr_label(trimmed);
 
 	let mut config = parse_resolver(addr_part)?;
 
@@ -66,6 +176,34 @@ fn parse_resolver_line(line: &str) -> Result<ResolverConfig> {
 	}
 
 	Ok(config)
+}
+
+/// Parse a resolver line, detecting transport scheme before splitting label.
+///
+/// For DoH/DoT URLs, the '#' inside URLs must not be treated as a comment
+/// delimiter, so we handle scheme-prefixed lines specially.
+fn split_addr_label(line: &str) -> (&str, Option<&str>) {
+	let trimmed = line.trim();
+
+	// For scheme-prefixed URLs, find '#' that comes after the URL
+	if trimmed.starts_with("https://") || trimmed.starts_with("tls://") {
+		// Find the first '#' that has whitespace before it (indicating a comment)
+		if let Some(idx) = trimmed.find(" #").or_else(|| trimmed.find("\t#")) {
+			let addr = trimmed[..idx].trim();
+			let label = trimmed[idx + 2..].trim();
+			return (addr, Some(label));
+		}
+		return (trimmed, None);
+	}
+
+	// Plain address: split on first '#'
+	if let Some(idx) = trimmed.find('#') {
+		let addr = trimmed[..idx].trim();
+		let label = trimmed[idx + 1..].trim();
+		(addr, Some(label))
+	} else {
+		(trimmed, None)
+	}
 }
 
 /// Read resolver addresses from a file, one per line.
@@ -104,7 +242,10 @@ pub fn system_resolvers() -> Vec<ResolverConfig> {
 		// Extract the address after "nameserver"
 		let parts: Vec<&str> = trimmed.split_whitespace().collect();
 		if parts.len() >= 2 {
-			if let Ok(resolver) = parse_resolver(parts[1]) {
+			if let Ok(mut resolver) = parse_resolver(parts[1]) {
+				resolver.is_system = true;
+				// System resolvers are always UDP
+				resolver.transport = DnsTransport::Udp;
 				resolvers.push(resolver);
 			}
 		}
@@ -143,22 +284,30 @@ pub fn default_resolvers() -> Vec<ResolverConfig> {
 		ResolverConfig {
 			label: "Cloudflare".to_string(),
 			addr: "1.1.1.1:53".parse().unwrap(),
-			intercepts_nxdomain: false,
+			transport: DnsTransport::Udp,
+			intercepts_nxdomain: false, is_system: false,
+			ptr_name: None, rebinding_protection: None, validates_dnssec: None,
 		},
 		ResolverConfig {
 			label: "Google".to_string(),
 			addr: "8.8.8.8:53".parse().unwrap(),
-			intercepts_nxdomain: false,
+			transport: DnsTransport::Udp,
+			intercepts_nxdomain: false, is_system: false,
+			ptr_name: None, rebinding_protection: None, validates_dnssec: None,
 		},
 		ResolverConfig {
 			label: "Quad9".to_string(),
 			addr: "9.9.9.9:53".parse().unwrap(),
-			intercepts_nxdomain: false,
+			transport: DnsTransport::Udp,
+			intercepts_nxdomain: false, is_system: false,
+			ptr_name: None, rebinding_protection: None, validates_dnssec: None,
 		},
 		ResolverConfig {
 			label: "OpenDNS".to_string(),
 			addr: "208.67.222.222:53".parse().unwrap(),
-			intercepts_nxdomain: false,
+			transport: DnsTransport::Udp,
+			intercepts_nxdomain: false, is_system: false,
+			ptr_name: None, rebinding_protection: None, validates_dnssec: None,
 		},
 	]
 }
@@ -220,5 +369,41 @@ mod tests {
 		let r = parse_resolver_line("8.8.8.8").unwrap();
 		assert_eq!(r.label, "8.8.8.8");
 		assert_eq!(r.addr.ip().to_string(), "8.8.8.8");
+	}
+
+	#[test]
+	fn test_doh_resolver() {
+		let r = parse_resolver("https://1.1.1.1/dns-query").unwrap();
+		assert_eq!(r.addr.port(), 443);
+		assert_eq!(r.addr.ip().to_string(), "1.1.1.1");
+		assert!(matches!(r.transport, DnsTransport::Doh { .. }));
+	}
+
+	#[test]
+	fn test_dot_resolver() {
+		let r = parse_resolver("tls://1.1.1.1").unwrap();
+		assert_eq!(r.addr.port(), 853);
+		assert_eq!(r.addr.ip().to_string(), "1.1.1.1");
+		assert!(matches!(r.transport, DnsTransport::Dot { .. }));
+	}
+
+	#[test]
+	fn test_dot_resolver_with_port() {
+		let r = parse_resolver("tls://9.9.9.9:8853").unwrap();
+		assert_eq!(r.addr.port(), 8853);
+		assert_eq!(r.addr.ip().to_string(), "9.9.9.9");
+	}
+
+	#[test]
+	fn test_doh_with_label() {
+		let r = parse_resolver_line("https://1.1.1.1/dns-query  # Cloudflare DoH").unwrap();
+		assert_eq!(r.label, "Cloudflare DoH");
+		assert!(matches!(r.transport, DnsTransport::Doh { .. }));
+	}
+
+	#[test]
+	fn test_udp_transport_default() {
+		let r = parse_resolver("8.8.8.8").unwrap();
+		assert!(matches!(r.transport, DnsTransport::Udp));
 	}
 }

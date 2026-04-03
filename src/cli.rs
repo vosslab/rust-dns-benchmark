@@ -1,9 +1,11 @@
 use clap::Parser;
 
+use crate::stats::SortMode;
+
 /// DNS resolver benchmark tool
 #[derive(Parser, Debug)]
 #[command(name = "dns-benchmark")]
-#[command(about = "Benchmark DNS resolver performance over UDP")]
+#[command(about = "Benchmark DNS resolver performance over UDP, DoT, and DoH")]
 pub struct Cli {
 	/// DNS resolver address (repeatable, e.g. 1.1.1.1 or 1.1.1.1:53)
 	#[arg(short = 'r', long = "resolver")]
@@ -81,7 +83,23 @@ pub struct Cli {
 	#[arg(short = 's', long = "seed")]
 	pub seed: Option<u64>,
 
-	/// Include system resolvers from /etc/resolv.conf
-	#[arg(long = "system-resolvers")]
-	pub system_resolvers: bool,
+	/// Exclude system resolvers from /etc/resolv.conf (included by default)
+	#[arg(long = "no-system-resolvers")]
+	pub no_system_resolvers: bool,
+
+	/// Sort order for results
+	#[arg(long = "sort", default_value = "score", value_enum)]
+	pub sort: SortMode,
+
+	/// Do not pin system resolvers to the top of results (pinned by default)
+	#[arg(long = "no-pin-system")]
+	pub no_pin_system: bool,
+
+	/// Disable mid-benchmark sidelining of slow resolvers
+	#[arg(long = "no-sideline")]
+	pub no_sideline: bool,
+
+	/// Maximum p50 latency (ms) before sidelining a resolver mid-benchmark
+	#[arg(long = "sideline-ms", default_value = "500")]
+	pub sideline_ms: u64,
 }

@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
@@ -9,15 +11,23 @@ use rand::rngs::StdRng;
 use anyhow::Result;
 
 use hickory_proto::op::ResponseCode;
+use rustls::ClientConfig;
+use tokio_rustls::TlsConnector;
 
 use crate::transport::{
-	ResolverConfig, QueryType, QueryResult, BenchmarkConfig,
+	DnsTransport, ResolverConfig, QueryType, QueryResult, BenchmarkConfig,
 };
-use crate::dns::{build_query, parse_response, check_nxdomain_interception};
+use crate::dns::{
+	build_query, parse_response, check_nxdomain_interception,
+	check_rebinding_protection, check_dnssec_validation,
+};
 use crate::stats::{
 	compute_set_stats, compute_uncertainty, detect_ties,
 	rank_resolvers, ResolverStats, ScoredResolver,
 };
+
+/// Shared pool of reqwest clients for DoH, keyed by resolver URL
+type DohClientPool = HashMap<String, reqwest::Client>;
 
 /// Send a single DNS query over UDP and measure latency.
 ///
@@ -121,6 +131,251 @@ async fn send_udp_query(
 	}
 }
 
+/// Send a single DNS query over TLS (DoT, RFC 7858) and measure latency.
+///
+/// Creates a new TCP+TLS connection per query (no reuse) to measure
+/// cold-start latency including TLS handshake. Uses 2-byte length prefix
+/// per DNS-over-TCP convention.
+async fn send_dot_query(
+	resolver: std::net::SocketAddr,
+	hostname: &str,
+	query_bytes: &[u8],
+	timeout: Duration,
+	_txid: u16,
+	domain: &str,
+	query_type: QueryType,
+) -> QueryResult {
+	let resolver_label = resolver.ip().to_string();
+	let make_timeout_result = || QueryResult {
+		resolver: resolver_label.clone(),
+		domain: domain.to_string(),
+		query_type,
+		rcode: None,
+		latency: timeout,
+		success: false,
+		timeout: true,
+	};
+
+	// Build TLS config with system root certificates
+	let root_store = rustls::RootCertStore::from_iter(
+		webpki_roots::TLS_SERVER_ROOTS.iter().cloned()
+	);
+	let tls_config = ClientConfig::builder()
+		.with_root_certificates(root_store)
+		.with_no_client_auth();
+	let connector = TlsConnector::from(Arc::new(tls_config));
+
+	// Parse SNI hostname
+	let server_name = match rustls::pki_types::ServerName::try_from(hostname.to_string()) {
+		Ok(sn) => sn,
+		Err(_) => {
+			// Fall back to IP-based if hostname doesn't parse
+			match rustls::pki_types::ServerName::try_from(resolver.ip().to_string()) {
+				Ok(sn) => sn,
+				Err(_) => return make_timeout_result(),
+			}
+		}
+	};
+
+	let start = Instant::now();
+
+	// TCP connect with timeout
+	let tcp_stream = match tokio::time::timeout(timeout, TcpStream::connect(resolver)).await {
+		Ok(Ok(s)) => s,
+		_ => return make_timeout_result(),
+	};
+
+	// TLS handshake with remaining timeout
+	let remaining = timeout.saturating_sub(start.elapsed());
+	let mut tls_stream = match tokio::time::timeout(
+		remaining, connector.connect(server_name, tcp_stream),
+	).await {
+		Ok(Ok(s)) => s,
+		_ => return make_timeout_result(),
+	};
+
+	// Send DNS query with 2-byte TCP length prefix
+	let len_prefix = (query_bytes.len() as u16).to_be_bytes();
+	let remaining = timeout.saturating_sub(start.elapsed());
+	let send_result = tokio::time::timeout(remaining, async {
+		tls_stream.write_all(&len_prefix).await?;
+		tls_stream.write_all(query_bytes).await?;
+		tls_stream.flush().await
+	}).await;
+	if send_result.is_err() || send_result.unwrap().is_err() {
+		return make_timeout_result();
+	}
+
+	// Read 2-byte response length prefix
+	let remaining = timeout.saturating_sub(start.elapsed());
+	let resp_len = match tokio::time::timeout(remaining, async {
+		let mut len_buf = [0u8; 2];
+		tls_stream.read_exact(&mut len_buf).await?;
+		Ok::<u16, std::io::Error>(u16::from_be_bytes(len_buf))
+	}).await {
+		Ok(Ok(len)) => len as usize,
+		_ => return make_timeout_result(),
+	};
+
+	// Read response body
+	let remaining = timeout.saturating_sub(start.elapsed());
+	let resp_bytes = match tokio::time::timeout(remaining, async {
+		let mut buf = vec![0u8; resp_len];
+		tls_stream.read_exact(&mut buf).await?;
+		Ok::<Vec<u8>, std::io::Error>(buf)
+	}).await {
+		Ok(Ok(buf)) => buf,
+		_ => return make_timeout_result(),
+	};
+
+	let latency = start.elapsed();
+
+	// Parse the DNS response
+	match parse_response(&resp_bytes, _txid, domain, query_type) {
+		Ok(response) => {
+			let success = response.rcode == ResponseCode::NoError;
+			QueryResult {
+				resolver: resolver_label,
+				domain: domain.to_string(),
+				query_type,
+				rcode: Some(response.rcode_str),
+				latency,
+				success,
+				timeout: false,
+			}
+		}
+		Err(_) => make_timeout_result(),
+	}
+}
+
+/// Send a single DNS query over HTTPS (DoH, RFC 8484) and measure latency.
+///
+/// Uses a shared reqwest::Client per resolver for HTTP/2 connection reuse,
+/// which reflects how DoH works in practice.
+async fn send_doh_query(
+	url: &str,
+	query_bytes: &[u8],
+	timeout: Duration,
+	domain: &str,
+	query_type: QueryType,
+	client: &reqwest::Client,
+) -> QueryResult {
+	let make_timeout_result = || QueryResult {
+		resolver: url.to_string(),
+		domain: domain.to_string(),
+		query_type,
+		rcode: None,
+		latency: timeout,
+		success: false,
+		timeout: true,
+	};
+
+	let start = Instant::now();
+
+	// POST DNS query as application/dns-message (RFC 8484)
+	let response = match tokio::time::timeout(timeout, async {
+		client.post(url)
+			.header("Content-Type", "application/dns-message")
+			.header("Accept", "application/dns-message")
+			.body(query_bytes.to_vec())
+			.send()
+			.await
+	}).await {
+		Ok(Ok(r)) => r,
+		_ => return make_timeout_result(),
+	};
+
+	// Read response body
+	let remaining = timeout.saturating_sub(start.elapsed());
+	let resp_bytes = match tokio::time::timeout(remaining, response.bytes()).await {
+		Ok(Ok(b)) => b,
+		_ => return make_timeout_result(),
+	};
+
+	let latency = start.elapsed();
+
+	// Parse the DNS wire-format response
+	// DoH responses don't need txid validation since HTTP handles request matching
+	match parse_response(&resp_bytes, 0, domain, query_type) {
+		Ok(response) => {
+			// Accept even if txid doesn't match (DoH handles correlation via HTTP)
+			let success = response.rcode == ResponseCode::NoError;
+			QueryResult {
+				resolver: url.to_string(),
+				domain: domain.to_string(),
+				query_type,
+				rcode: Some(response.rcode_str),
+				latency,
+				success,
+				timeout: false,
+			}
+		}
+		Err(_) => {
+			// Try parsing without txid check by using txid from response
+			if resp_bytes.len() >= 2 {
+				let resp_txid = u16::from_be_bytes([resp_bytes[0], resp_bytes[1]]);
+				if let Ok(response) = parse_response(&resp_bytes, resp_txid, domain, query_type) {
+					let success = response.rcode == ResponseCode::NoError;
+					return QueryResult {
+						resolver: url.to_string(),
+						domain: domain.to_string(),
+						query_type,
+						rcode: Some(response.rcode_str),
+						latency,
+						success,
+						timeout: false,
+					};
+				}
+			}
+			make_timeout_result()
+		}
+	}
+}
+
+/// Dispatch a query to the appropriate transport based on resolver config.
+async fn dispatch_query(
+	resolver: &ResolverConfig,
+	query_bytes: &[u8],
+	timeout: Duration,
+	txid: u16,
+	domain: &str,
+	query_type: QueryType,
+	doh_clients: &DohClientPool,
+) -> QueryResult {
+	match &resolver.transport {
+		DnsTransport::Udp => {
+			send_udp_query(resolver.addr, query_bytes, timeout, txid, domain, query_type).await
+		}
+		DnsTransport::Dot { hostname } => {
+			send_dot_query(
+				resolver.addr, hostname, query_bytes, timeout,
+				txid, domain, query_type,
+			).await
+		}
+		DnsTransport::Doh { url } => {
+			let client = doh_clients.get(url).expect("DoH client not found");
+			send_doh_query(url, query_bytes, timeout, domain, query_type, client).await
+		}
+	}
+}
+
+/// Build a DoH client pool with one reqwest::Client per DoH resolver URL.
+pub fn build_doh_client_pool(resolvers: &[ResolverConfig]) -> DohClientPool {
+	let mut pool = HashMap::new();
+	for r in resolvers {
+		if let DnsTransport::Doh { url } = &r.transport {
+			pool.entry(url.clone()).or_insert_with(|| {
+				reqwest::Client::builder()
+					.use_rustls_tls()
+					.http2_prior_knowledge()
+					.build()
+					.expect("failed to build DoH HTTP client")
+			});
+		}
+	}
+	pool
+}
+
 /// A single query task: resolver + domain + query type + set membership
 #[derive(Clone, Debug)]
 struct QueryTask {
@@ -145,16 +400,16 @@ pub async fn run_characterization(
 	let semaphore = std::sync::Arc::new(Semaphore::new(32));
 	let mut handles = Vec::new();
 
-	for i in 0..resolvers.len() {
-		let addr = resolvers[i].addr;
-		let label = resolvers[i].label.clone();
+	for (i, resolver) in resolvers.iter().enumerate() {
+		let addr = resolver.addr;
+		let label = resolver.label.clone();
 		let sem = semaphore.clone();
-		let timeout = timeout;
+		let tm = timeout;
 		let domains = nxdomain_domains.to_vec();
 
 		handles.push(tokio::spawn(async move {
 			let _permit = sem.acquire().await.unwrap();
-			let intercepts = check_nxdomain_interception(addr, timeout, &domains).await;
+			let intercepts = check_nxdomain_interception(addr, tm, &domains).await;
 			(i, label, addr, intercepts)
 		}));
 	}
@@ -171,6 +426,74 @@ pub async fn run_characterization(
 			}
 		}
 	}
+	println!();
+
+	// Check rebinding protection
+	println!("Checking DNS rebinding protection ({} resolvers)...", resolvers.len());
+	let mut rebind_handles = Vec::new();
+	for (i, resolver) in resolvers.iter().enumerate() {
+		let addr = resolver.addr;
+		let label = resolver.label.clone();
+		let sem = semaphore.clone();
+		let tm = timeout;
+
+		rebind_handles.push(tokio::spawn(async move {
+			let _permit = sem.acquire().await.unwrap();
+			let protection = check_rebinding_protection(addr, tm).await;
+			(i, label, addr, protection)
+		}));
+	}
+
+	for handle in rebind_handles {
+		match handle.await {
+			Ok((idx, label, addr, protection)) => {
+				resolvers[idx].rebinding_protection = protection;
+				let status = match protection {
+					Some(true) => "PROTECTED",
+					Some(false) => "not protected",
+					None => "unknown",
+				};
+				println!("  {} ({}): {}", label, addr.ip(), status);
+			}
+			Err(e) => {
+				eprintln!("Warning: rebinding check failed: {}", e);
+			}
+		}
+	}
+	println!();
+
+	// Check DNSSEC validation
+	println!("Checking DNSSEC validation ({} resolvers)...", resolvers.len());
+	let mut dnssec_handles = Vec::new();
+	for (i, resolver) in resolvers.iter().enumerate() {
+		let addr = resolver.addr;
+		let label = resolver.label.clone();
+		let sem = semaphore.clone();
+		let tm = timeout;
+
+		dnssec_handles.push(tokio::spawn(async move {
+			let _permit = sem.acquire().await.unwrap();
+			let validates = check_dnssec_validation(addr, tm).await;
+			(i, label, addr, validates)
+		}));
+	}
+
+	for handle in dnssec_handles {
+		match handle.await {
+			Ok((idx, label, addr, validates)) => {
+				resolvers[idx].validates_dnssec = validates;
+				let status = match validates {
+					Some(true) => "VALIDATES",
+					Some(false) => "does not validate",
+					None => "unknown",
+				};
+				println!("  {} ({}): {}", label, addr.ip(), status);
+			}
+			Err(e) => {
+				eprintln!("Warning: DNSSEC validation check failed: {}", e);
+			}
+		}
+	}
 
 	println!();
 }
@@ -183,6 +506,7 @@ pub async fn run_discovery(
 	resolvers: &[ResolverConfig],
 	warm_domains: &[String],
 	config: &BenchmarkConfig,
+	doh_clients: &DohClientPool,
 ) -> Result<Vec<ResolverConfig>> {
 	let top_n = config.top_n;
 	println!("Discovery mode: screening {} resolvers...", resolvers.len());
@@ -197,10 +521,10 @@ pub async fn run_discovery(
 	let mut screen_handles = Vec::new();
 	for resolver in resolvers {
 		let sem = semaphore.clone();
-		let addr = resolver.addr;
 		let dnssec = config.dnssec;
 		let domain = screen_domain.to_string();
 		let resolver_clone = resolver.clone();
+		let doh_clients = doh_clients.clone();
 
 		screen_handles.push(tokio::spawn(async move {
 			let _permit = sem.acquire().await.unwrap();
@@ -211,9 +535,9 @@ pub async fn run_discovery(
 				Ok(b) => b,
 				Err(_) => return (resolver_clone, false),
 			};
-			let result = send_udp_query(
-				addr, &query_bytes, screen_timeout,
-				txid, &domain, QueryType::A,
+			let result = dispatch_query(
+				&resolver_clone, &query_bytes, screen_timeout,
+				txid, &domain, QueryType::A, &doh_clients,
 			).await;
 			(resolver_clone, result.success)
 		}));
@@ -249,10 +573,11 @@ pub async fn run_discovery(
 	for resolver in &survivors {
 		for domain in warm_domains {
 			let sem = semaphore.clone();
-			let addr = resolver.addr;
+			let resolver_clone = resolver.clone();
 			let timeout = config.timeout;
 			let dnssec = config.dnssec;
 			let domain_clone = domain.clone();
+			let doh_clients = doh_clients.clone();
 
 			bench_handles.push(tokio::spawn(async move {
 				let _permit = sem.acquire().await.unwrap();
@@ -261,30 +586,28 @@ pub async fn run_discovery(
 					&domain_clone, QueryType::A, txid, dnssec,
 				) {
 					Ok(b) => b,
-					Err(_) => return (addr.ip().to_string(), None),
+					Err(_) => return (resolver_clone.addr.ip().to_string(), None),
 				};
-				let result = send_udp_query(
-					addr, &query_bytes, timeout,
-					txid, &domain_clone, QueryType::A,
+				let result = dispatch_query(
+					&resolver_clone, &query_bytes, timeout,
+					txid, &domain_clone, QueryType::A, &doh_clients,
 				).await;
 				if result.success {
 					let latency_ms = result.latency.as_secs_f64() * 1000.0;
-					(addr.ip().to_string(), Some(latency_ms))
+					(resolver_clone.addr.ip().to_string(), Some(latency_ms))
 				} else {
-					(addr.ip().to_string(), None)
+					(resolver_clone.addr.ip().to_string(), None)
 				}
 			}));
 		}
 	}
 
 	for handle in bench_handles {
-		if let Ok((ip, latency_opt)) = handle.await {
-			if let Some(latency_ms) = latency_opt {
-				resolver_latencies
-					.entry(ip)
-					.or_default()
-					.push(latency_ms);
-			}
+		if let Ok((ip, Some(latency_ms))) = handle.await {
+			resolver_latencies
+				.entry(ip)
+				.or_default()
+				.push(latency_ms);
 		}
 	}
 
@@ -320,6 +643,7 @@ pub async fn run_benchmark(
 	cold_domains: &[String],
 	tld_domains: &[String],
 	config: &BenchmarkConfig,
+	doh_clients: &DohClientPool,
 ) -> Result<Vec<ScoredResolver>> {
 	// Determine which query types to use
 	let query_types = if config.query_aaaa {
@@ -380,11 +704,21 @@ pub async fn run_benchmark(
 		None => StdRng::from_entropy(),
 	};
 
+	// Track sidelined resolvers (by IP string)
+	let mut sidelined: std::collections::HashSet<String> = std::collections::HashSet::new();
+	// Build label map for sidelining messages
+	let label_map_for_sideline: HashMap<String, String> = resolvers.iter()
+		.map(|r| (r.addr.ip().to_string(), r.label.clone()))
+		.collect();
+
 	for round in 0..config.rounds {
 		println!("  Round {}/{}", round + 1, config.rounds);
 
-		// Shuffle tasks for this round
+		// Filter out sidelined resolvers for this round
 		let mut round_tasks = tasks.clone();
+		if !sidelined.is_empty() {
+			round_tasks.retain(|t| !sidelined.contains(&t.resolver.addr.ip().to_string()));
+		}
 		round_tasks.shuffle(&mut rng);
 
 		// Spawn all query tasks for this round
@@ -394,6 +728,7 @@ pub async fn run_benchmark(
 			let timeout = config.timeout;
 			let spacing = config.inter_query_spacing;
 			let dnssec = config.dnssec;
+			let doh_clients = doh_clients.clone();
 
 			handles.push(tokio::spawn(async move {
 				// Acquire semaphore permit for concurrency control
@@ -425,10 +760,11 @@ pub async fn run_benchmark(
 					}
 				};
 
-				// Send query and measure latency (each task gets its own socket)
-				let result = send_udp_query(
-					task.resolver.addr, &query_bytes,
+				// Send query via appropriate transport
+				let result = dispatch_query(
+					&task.resolver, &query_bytes,
 					timeout, txid, &task.domain, task.query_type,
+					&doh_clients,
 				).await;
 
 				(task, result)
@@ -443,6 +779,48 @@ pub async fn run_benchmark(
 				}
 				Err(e) => {
 					eprintln!("Warning: task failed: {}", e);
+				}
+			}
+		}
+
+		// Mid-benchmark sidelining: check for slow/dead resolvers after each round
+		if config.sideline && round < config.rounds - 1 {
+			let mut per_resolver: HashMap<String, (usize, usize, Vec<f64>)> = HashMap::new();
+			for (task, result) in &all_results {
+				let ip = task.resolver.addr.ip().to_string();
+				if sidelined.contains(&ip) {
+					continue;
+				}
+				let entry = per_resolver.entry(ip).or_insert((0, 0, Vec::new()));
+				entry.0 += 1; // total
+				if result.timeout { entry.1 += 1; } // timeouts
+				if result.success {
+					entry.2.push(result.latency.as_secs_f64() * 1000.0);
+				}
+			}
+			for (ip, (total, timeouts, latencies)) in &per_resolver {
+				let timeout_rate = *timeouts as f64 / *total as f64;
+				// Sideline if >80% timeouts
+				if timeout_rate > 0.8 {
+					let label = label_map_for_sideline.get(ip)
+						.cloned().unwrap_or_else(|| ip.clone());
+					println!("  Sidelined {} ({}) -- {:.0}% timeouts",
+						label, ip, timeout_rate * 100.0);
+					sidelined.insert(ip.clone());
+					continue;
+				}
+				// Sideline if p50 exceeds threshold
+				if !latencies.is_empty() {
+					let mut sorted = latencies.clone();
+					sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+					let p50 = sorted[sorted.len() / 2];
+					if p50 > config.sideline_ms {
+						let label = label_map_for_sideline.get(ip)
+							.cloned().unwrap_or_else(|| ip.clone());
+						println!("  Sidelined {} ({}) -- p50 {:.0} ms > {} ms threshold",
+							label, ip, p50, config.sideline_ms as u64);
+						sidelined.insert(ip.clone());
+					}
 				}
 			}
 		}
@@ -494,6 +872,21 @@ pub async fn run_benchmark(
 	let intercept_map: HashMap<String, bool> = resolvers.iter()
 		.map(|r| (r.addr.ip().to_string(), r.intercepts_nxdomain))
 		.collect();
+	let system_map: HashMap<String, bool> = resolvers.iter()
+		.map(|r| (r.addr.ip().to_string(), r.is_system))
+		.collect();
+	let transport_map: HashMap<String, String> = resolvers.iter()
+		.map(|r| (r.addr.ip().to_string(), r.transport.to_string()))
+		.collect();
+	let ptr_map: HashMap<String, Option<String>> = resolvers.iter()
+		.map(|r| (r.addr.ip().to_string(), r.ptr_name.clone()))
+		.collect();
+	let rebinding_map: HashMap<String, Option<bool>> = resolvers.iter()
+		.map(|r| (r.addr.ip().to_string(), r.rebinding_protection))
+		.collect();
+	let dnssec_map: HashMap<String, Option<bool>> = resolvers.iter()
+		.map(|r| (r.addr.ip().to_string(), r.validates_dnssec))
+		.collect();
 
 	// Build ResolverStats for each resolver
 	let mut stats_list: Vec<ResolverStats> = Vec::new();
@@ -542,19 +935,42 @@ pub async fn run_benchmark(
 		combined.extend(&agg.cold_latencies);
 		all_latencies_per_resolver.push(combined);
 
+		let is_system = system_map.get(resolver_ip)
+			.copied()
+			.unwrap_or(false);
+
+		let transport_label = transport_map.get(resolver_ip)
+			.cloned()
+			.unwrap_or_else(|| "UDP".to_string());
+
+		let ptr_name = ptr_map.get(resolver_ip)
+			.cloned()
+			.unwrap_or(None);
+		let rebinding = rebinding_map.get(resolver_ip)
+			.copied()
+			.unwrap_or(None);
+		let dnssec_validates = dnssec_map.get(resolver_ip)
+			.copied()
+			.unwrap_or(None);
+
 		stats_list.push(ResolverStats {
 			label,
 			addr: resolver_ip.clone(),
+			transport: transport_label,
 			warm: warm_stats,
 			cold: cold_stats,
 			tld: tld_stats,
 			overall_score,
 			success_rate,
 			intercepts_nxdomain: intercepts,
+			is_system,
+			ptr_name,
+			rebinding_protection: rebinding,
+			validates_dnssec: dnssec_validates,
 		});
 	}
 
-	let mut ranked = rank_resolvers(stats_list);
+	let mut ranked = rank_resolvers(stats_list, config.sort_mode);
 
 	// Build label-to-uncertainty map for O(1) lookup
 	let uncertainty_map: HashMap<String, f64> = resolver_data.iter()

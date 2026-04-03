@@ -46,6 +46,17 @@ pub fn print_config_summary(
 	if config.discover {
 		println!("Discovery:      top {}", config.top_n);
 	}
+	let sort_label = match config.sort_mode {
+		crate::stats::SortMode::Score => "overall score",
+		crate::stats::SortMode::Warm => "warm (cached) p50",
+		crate::stats::SortMode::Cold => "cold (uncached) p50",
+		crate::stats::SortMode::Tld => "TLD p50",
+		crate::stats::SortMode::Name => "name",
+	};
+	println!("Sort by:        {}", sort_label);
+	if config.pin_system {
+		println!("Pin system:     yes");
+	}
 	if let Some(seed) = config.seed {
 		println!("Seed:           {}", seed);
 	}
@@ -58,16 +69,25 @@ pub fn print_results_table(results: &[ScoredResolver], show_tld: bool) {
 	table.load_preset(UTF8_FULL);
 	table.set_content_arrangement(ContentArrangement::Dynamic);
 
+	// Check if any resolvers use non-UDP transport
+	let has_mixed_transport = results.iter()
+		.any(|r| r.stats.transport != "UDP");
+
 	// Build header
 	let mut header = vec![
-		"Rank", "Resolver", "IP Address", "Score",
-		"Warm p50", "Cold p50",
+		"Rank", "Resolver", "IP Address",
 	];
+	if has_mixed_transport {
+		header.push("Proto");
+	}
+	header.extend_from_slice(&["Score", "Warm p50", "Cold p50"]);
 	if show_tld {
 		header.push("TLD p50");
 	}
 	header.push("Success %");
 	header.push("NXDOMAIN");
+	header.push("DNSSEC");
+	header.push("Rebind");
 	table.set_header(header);
 
 	let mut has_ties = false;
@@ -89,14 +109,31 @@ pub fn print_results_table(results: &[ScoredResolver], show_tld: bool) {
 			"OK".to_string()
 		};
 
+		// Build label with optional system marker and PTR name
+		let mut label = s.label.clone();
+		if let Some(ref ptr) = s.ptr_name {
+			// Only show PTR if it differs from the label
+			if ptr != &s.label {
+				label = format!("{} ({})", label, ptr);
+			}
+		}
+		if r.is_system {
+			label = format!("{} [sys]", label);
+		}
+
 		let mut row = vec![
 			rank_str,
-			s.label.clone(),
+			label,
 			s.addr.clone(),
+		];
+		if has_mixed_transport {
+			row.push(s.transport.clone());
+		}
+		row.extend_from_slice(&[
 			format!("{:.1}", s.overall_score),
 			format!("{:.1} ms", s.warm.p50_ms),
 			format!("{:.1} ms", s.cold.p50_ms),
-		];
+		]);
 		if show_tld {
 			if let Some(ref tld) = s.tld {
 				row.push(format!("{:.1} ms", tld.p50_ms));
@@ -104,8 +141,21 @@ pub fn print_results_table(results: &[ScoredResolver], show_tld: bool) {
 				row.push("-".to_string());
 			}
 		}
+		let dnssec_str = match s.validates_dnssec {
+			Some(true) => "Yes".to_string(),
+			Some(false) => "No".to_string(),
+			None => "-".to_string(),
+		};
+		let rebind_str = match s.rebinding_protection {
+			Some(true) => "Yes".to_string(),
+			Some(false) => "No".to_string(),
+			None => "-".to_string(),
+		};
+
 		row.push(format!("{:.1}%", s.success_rate));
 		row.push(nxdomain_str);
+		row.push(dnssec_str);
+		row.push(rebind_str);
 
 		table.add_row(row);
 	}
@@ -125,7 +175,7 @@ pub fn write_csv(path: &str, results: &[ScoredResolver], show_tld: bool) -> Resu
 
 	// Build header
 	let mut header = vec![
-		"rank", "resolver", "ip_address", "overall_score",
+		"rank", "resolver", "ip_address", "transport", "overall_score",
 		"warm_p50_ms", "warm_p95_ms", "warm_mean_ms", "warm_stddev_ms",
 		"warm_success", "warm_timeout", "warm_total", "warm_score",
 		"cold_p50_ms", "cold_p95_ms", "cold_mean_ms", "cold_stddev_ms",
@@ -138,7 +188,8 @@ pub fn write_csv(path: &str, results: &[ScoredResolver], show_tld: bool) -> Resu
 		]);
 	}
 	header.extend_from_slice(&[
-		"success_rate", "intercepts_nxdomain", "tie_group",
+		"success_rate", "intercepts_nxdomain", "validates_dnssec",
+		"rebinding_protection", "ptr_name", "tie_group",
 	]);
 	writer.write_record(&header)?;
 
@@ -153,6 +204,7 @@ pub fn write_csv(path: &str, results: &[ScoredResolver], show_tld: bool) -> Resu
 			rank_str,
 			s.label.clone(),
 			s.addr.clone(),
+			s.transport.clone(),
 			format!("{:.2}", s.overall_score),
 			format!("{:.2}", s.warm.p50_ms),
 			format!("{:.2}", s.warm.p95_ms),
@@ -191,9 +243,19 @@ pub fn write_csv(path: &str, results: &[ScoredResolver], show_tld: bool) -> Resu
 			}
 		}
 		let intercepts_str = if s.intercepts_nxdomain { "true" } else { "false" };
+		let dnssec_csv = match s.validates_dnssec {
+			Some(true) => "true", Some(false) => "false", None => "",
+		};
+		let rebind_csv = match s.rebinding_protection {
+			Some(true) => "true", Some(false) => "false", None => "",
+		};
+		let ptr_str = s.ptr_name.clone().unwrap_or_default();
 		let tie_str = r.tie_group.clone().unwrap_or_default();
 		row.push(format!("{:.1}", s.success_rate));
 		row.push(intercepts_str.to_string());
+		row.push(dnssec_csv.to_string());
+		row.push(rebind_csv.to_string());
+		row.push(ptr_str);
 		row.push(tie_str);
 
 		writer.write_record(&row)?;

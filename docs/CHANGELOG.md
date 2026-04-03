@@ -2,7 +2,39 @@
 
 ## 2026-04-02
 
+### Additions and New Features
+- Added DNS over TLS (DoT) transport support via `tls://` prefix (e.g., `tls://1.1.1.1`)
+- Added DNS over HTTPS (DoH) transport support via `https://` prefix (e.g., `https://1.1.1.1/dns-query`)
+- Added transport dispatch layer: `dispatch_query()` routes queries to UDP, DoT, or DoH based on resolver config
+- Added `DnsTransport` enum (`Udp`, `Dot`, `Doh`) to `ResolverConfig` for transport-aware resolver handling
+- Added protocol column to results table when mixed transports are present; transport always in CSV output
+- Added mid-benchmark sidelining: slow resolvers (>80% timeouts or p50 > threshold) are dropped between rounds
+- Added `--sideline-ms` flag (default: 500) and `--no-sideline` flag to control sidelining behavior
+- Added reverse DNS (PTR) lookups for all resolver IPs during characterization phase
+- PTR hostnames shown in results table next to resolver label when available
+- Added DNS rebinding protection detection: checks if resolvers filter private/loopback IPs from responses
+- Added DNSSEC validation verification: queries `dnssec-failed.org` (intentionally broken DNSSEC) to detect validating resolvers
+- DNSSEC validation and rebinding protection columns added to results table and CSV output
+- Added filtering of resolvers with <50% success rate to reduce noise in results
+- Added `--sort` flag to sort results by: `score` (default), `warm`, `cold`, `tld`, or `name`
+- Added `--pin-system` flag to pin system resolvers (from `/etc/resolv.conf`) to the top of results
+- Added `is_system` tracking through `ResolverConfig`, `ResolverStats`, and `ScoredResolver` to identify system resolvers
+- System resolvers are marked with `[sys]` in the output table
+- Sort mode and pin status are shown in the configuration summary
+
+### Behavior or Interface Changes
+- Version bumped to 26.04.0
+- Default mode now loads both master resolver list AND system resolvers for comprehensive testing
+- System resolvers now included by default (use `--no-system-resolvers` to opt out, replaces `--system-resolvers`)
+- System resolvers are deduplicated against the master list to avoid duplicate entries
+- System resolvers now pinned to top by default (use `--no-pin-system` to opt out, replaces `--pin-system`)
+- New dependencies: `reqwest` (DoH), `tokio-rustls`/`rustls`/`webpki-roots` (DoT), `hickory-resolver` (PTR lookups)
+- DoT uses per-query TLS connections (cold-start measurement); DoH uses shared HTTP/2 connections (realistic usage)
+- Resolvers with <50% success rate are now filtered from results by default
+
 ### Fixes and Maintenance
+- Fixed all clippy warnings (loop patterns, redundant bindings, collapsed if-let)
+- Fixed dead resolvers (0% success) sorting to rank #1 instead of last; `set_score()` now returns infinity when `success_count == 0` (`src/stats.rs`)
 - Wired up `--nxdomain-domains` CLI flag to `run_characterization()` so custom NXDOMAIN probe domains are now used instead of a single hardcoded domain (`src/dns.rs`, `src/bench.rs`, `src/main.rs`)
 - Connected `default_nxdomain_domains()` (10 `.invalid` probe domains) as the default when no custom file is provided
 - Refactored `check_nxdomain_interception()` to accept a domain list and probe each domain, improving detection coverage

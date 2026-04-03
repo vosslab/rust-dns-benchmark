@@ -3,6 +3,7 @@ mod cli;
 mod dns;
 mod domains;
 mod output;
+mod rdns;
 mod resolver;
 mod stats;
 mod transport;
@@ -19,6 +20,7 @@ async fn main() -> anyhow::Result<()> {
 
 	// Collect resolvers from all sources
 	let mut resolvers = Vec::new();
+	let user_specified = !cli.resolvers.is_empty() || cli.resolver_file.is_some();
 
 	// From CLI flags
 	for r in &cli.resolvers {
@@ -30,14 +32,17 @@ async fn main() -> anyhow::Result<()> {
 		resolvers.extend(resolver::read_resolver_file(path)?);
 	}
 
-	// System resolvers
-	if cli.system_resolvers {
-		resolvers.extend(resolver::system_resolvers());
+	// When no resolvers explicitly specified, load the master list by default
+	if !user_specified {
+		resolvers.extend(resolver::default_resolvers());
 	}
 
-	// Fall back to defaults if no resolvers specified
-	if resolvers.is_empty() {
-		resolvers = resolver::default_resolvers();
+	// System resolvers (included by default, opt out with --no-system-resolvers)
+	if !cli.no_system_resolvers {
+		let mut sys = resolver::system_resolvers();
+		// Deduplicate: skip system resolvers already in the list
+		sys.retain(|s| !resolvers.iter().any(|r| r.addr.ip() == s.addr.ip()));
+		resolvers.extend(sys);
 	}
 
 	// Collect domains from files or defaults
@@ -78,6 +83,10 @@ async fn main() -> anyhow::Result<()> {
 		discover,
 		top_n: cli.top,
 		max_resolver_ms: cli.max_resolver_ms as f64,
+		sort_mode: cli.sort,
+		pin_system: !cli.no_pin_system,
+		sideline: !cli.no_sideline,
+		sideline_ms: cli.sideline_ms as f64,
 	};
 
 	// Print configuration summary
@@ -86,21 +95,39 @@ async fn main() -> anyhow::Result<()> {
 		tld_domains.len(), &config,
 	);
 
+	// Build DoH client pool for any DoH resolvers
+	let doh_clients = bench::build_doh_client_pool(&resolvers);
+
 	// Discovery mode: prefilter large resolver lists BEFORE characterization
 	// This avoids wasting time characterizing resolvers that will be dropped
 	if config.discover {
-		resolvers = bench::run_discovery(&resolvers, &warm_domains, &config).await?;
+		resolvers = bench::run_discovery(
+			&resolvers, &warm_domains, &config, &doh_clients,
+		).await?;
 		println!();
 	}
 
-	// Run NXDOMAIN interception characterization (only on surviving resolvers)
+	// Run reverse DNS (PTR) lookups and NXDOMAIN interception characterization
+	rdns::resolve_ptr_names(&mut resolvers, config.timeout).await;
 	bench::run_characterization(&mut resolvers, config.timeout, &nxdomain_domains).await;
 
 	// Run benchmark
 	println!("Running benchmark...");
 	let mut results = bench::run_benchmark(
 		&resolvers, &warm_domains, &cold_domains, &tld_domains, &config,
+		&doh_clients,
 	).await?;
+
+	// Filter out resolvers with <50% success rate (too noisy to report)
+	let before_count = results.len();
+	results.retain(|r| r.stats.success_rate >= 50.0);
+	let low_success_count = before_count - results.len();
+	if low_success_count > 0 {
+		println!(
+			"Filtered {} resolver(s) with success rate < 50%",
+			low_success_count,
+		);
+	}
 
 	// Filter out resolvers slower than the max latency threshold
 	let before_count = results.len();
@@ -113,7 +140,17 @@ async fn main() -> anyhow::Result<()> {
 		);
 	}
 
-	// Re-rank after filtering
+	// Pin system resolvers to top if requested
+	if config.pin_system {
+		let (mut pinned, mut rest): (Vec<_>, Vec<_>) = results
+			.into_iter()
+			.partition(|r| r.is_system);
+		// Preserve sort order within each group
+		pinned.append(&mut rest);
+		results = pinned;
+	}
+
+	// Re-rank after filtering and pinning
 	for (i, r) in results.iter_mut().enumerate() {
 		r.rank = i + 1;
 		r.tie_group = None;

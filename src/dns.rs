@@ -94,6 +94,190 @@ pub fn parse_response(
 	})
 }
 
+/// Build a DNS PTR query for reverse DNS lookups.
+pub fn build_ptr_query(ptr_domain: &str, txid: u16) -> Result<Vec<u8>> {
+	let name = Name::from_ascii(ptr_domain)
+		.map_err(|e| anyhow!("invalid PTR domain '{}': {}", ptr_domain, e))?;
+
+	let mut message = Message::new();
+	message.set_id(txid);
+	message.set_recursion_desired(true);
+	message.add_query(Query::query(name, RecordType::PTR));
+
+	let bytes = message.to_vec()
+		.map_err(|e| anyhow!("failed to serialize PTR query: {}", e))?;
+	Ok(bytes)
+}
+
+/// Parse a PTR response and extract the hostname.
+///
+/// Returns the first PTR record's hostname, or None if no PTR records found.
+pub fn parse_ptr_response(bytes: &[u8], expected_txid: u16) -> Option<String> {
+	let message = Message::from_vec(bytes).ok()?;
+	if message.id() != expected_txid {
+		return None;
+	}
+	if message.message_type() != MessageType::Response {
+		return None;
+	}
+
+	// Find the first PTR record in the answer section
+	for record in message.answers() {
+		if record.record_type() == RecordType::PTR {
+			let rdata = record.data();
+			// Extract the PTR hostname string
+			let ptr_str = format!("{}", rdata);
+			// Remove trailing dot if present
+			let hostname = ptr_str.trim_end_matches('.').to_string();
+			return Some(hostname);
+		}
+	}
+	None
+}
+
+/// Check whether a resolver has DNS rebinding protection.
+///
+/// Queries domains known to resolve to private/loopback IP addresses.
+/// If the resolver blocks or filters these responses, it has rebinding protection.
+/// We query known rebinding test domains and check if the response is filtered.
+pub async fn check_rebinding_protection(
+	resolver_addr: std::net::SocketAddr,
+	timeout: Duration,
+) -> Option<bool> {
+	// Test domains that resolve to loopback/private IPs
+	// These are well-known rebinding test domains
+	let test_domains = [
+		"localhost",           // Should resolve to 127.0.0.1
+	];
+
+	for domain in &test_domains {
+		let txid: u16 = rand::random();
+		let query_bytes = match build_query(domain, QueryType::A, txid, false) {
+			Ok(b) => b,
+			Err(_) => continue,
+		};
+
+		let bind_addr = if resolver_addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+		let socket = match UdpSocket::bind(bind_addr).await {
+			Ok(s) => s,
+			Err(_) => continue,
+		};
+
+		if socket.send_to(&query_bytes, resolver_addr).await.is_err() {
+			continue;
+		}
+
+		let mut buf = vec![0u8; 4096];
+		match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
+			Ok(Ok((len, _))) => {
+				let message = match Message::from_vec(&buf[..len]) {
+					Ok(m) => m,
+					Err(_) => continue,
+				};
+				if message.id() != txid { continue; }
+
+				// Check if any A records contain private/loopback IPs
+				let has_private_ip = message.answers().iter().any(|r| {
+					if r.record_type() == RecordType::A {
+						let rdata_str = format!("{}", r.data());
+						return is_private_ip(&rdata_str);
+					}
+					false
+				});
+
+				if has_private_ip {
+					// Resolver returned private IPs -- no rebinding protection
+					return Some(false);
+				}
+
+				// If we got a response but no private IPs, check if it was filtered
+				if message.response_code() == ResponseCode::NoError
+					&& message.answer_count() == 0 {
+					// Response filtered -- has rebinding protection
+					return Some(true);
+				}
+				if message.response_code() == ResponseCode::Refused
+					|| message.response_code() == ResponseCode::NXDomain {
+					// Resolver refused or said NXDOMAIN -- has rebinding protection
+					return Some(true);
+				}
+			}
+			_ => continue,
+		}
+	}
+	// Could not determine
+	None
+}
+
+/// Check if an IP address string is a private/loopback address.
+fn is_private_ip(ip_str: &str) -> bool {
+	if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
+		// Loopback: 127.0.0.0/8
+		if ip.octets()[0] == 127 { return true; }
+		// Private: 10.0.0.0/8
+		if ip.octets()[0] == 10 { return true; }
+		// Private: 172.16.0.0/12
+		if ip.octets()[0] == 172 && (ip.octets()[1] >= 16 && ip.octets()[1] <= 31) {
+			return true;
+		}
+		// Private: 192.168.0.0/16
+		if ip.octets()[0] == 192 && ip.octets()[1] == 168 { return true; }
+	}
+	false
+}
+
+/// Check whether a resolver validates DNSSEC signatures.
+///
+/// Queries `dnssec-failed.org`, a domain with intentionally broken DNSSEC.
+/// A validating resolver should return SERVFAIL for this domain.
+/// A non-validating resolver returns the answer normally.
+pub async fn check_dnssec_validation(
+	resolver_addr: std::net::SocketAddr,
+	timeout: Duration,
+) -> Option<bool> {
+	// dnssec-failed.org has intentionally broken DNSSEC signatures
+	let test_domain = "dnssec-failed.org";
+	let txid: u16 = rand::random();
+
+	// Query with DNSSEC DO bit set
+	let query_bytes = match build_query(test_domain, QueryType::A, txid, true) {
+		Ok(b) => b,
+		Err(_) => return None,
+	};
+
+	let bind_addr = if resolver_addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+	let socket = match UdpSocket::bind(bind_addr).await {
+		Ok(s) => s,
+		Err(_) => return None,
+	};
+
+	if socket.send_to(&query_bytes, resolver_addr).await.is_err() {
+		return None;
+	}
+
+	let mut buf = vec![0u8; 4096];
+	match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
+		Ok(Ok((len, _))) => {
+			let message = match Message::from_vec(&buf[..len]) {
+				Ok(m) => m,
+				Err(_) => return None,
+			};
+			if message.id() != txid { return None; }
+
+			// SERVFAIL for broken DNSSEC = resolver validates
+			if message.response_code() == ResponseCode::ServFail {
+				return Some(true);
+			}
+			// NoError = resolver does NOT validate DNSSEC
+			if message.response_code() == ResponseCode::NoError {
+				return Some(false);
+			}
+			None
+		}
+		_ => None,
+	}
+}
+
 /// Check whether a resolver intercepts NXDOMAIN responses.
 ///
 /// Queries a known-nonexistent domain (.invalid TLD per RFC 2606).

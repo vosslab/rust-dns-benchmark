@@ -1,8 +1,8 @@
 [package]
 name = "rust-dns-benchmark"
-version = "26.2.0"
+version = "26.4.0"
 edition = "2021"
-description = "A CLI tool that benchmarks DNS resolver performance over UDP"
+description = "A CLI tool that benchmarks DNS resolver performance over UDP, DoT, and DoH"
 license = "GPL-3.0"
 
 [dependencies]
@@ -14,3 +14,8 @@ comfy-table = "7"
 csv = "1"
 anyhow = "1"
 thiserror = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+webpki-roots = "0.26"
+hickory-resolver = "0.25"
