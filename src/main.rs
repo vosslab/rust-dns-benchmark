@@ -49,6 +49,10 @@ async fn main() -> anyhow::Result<()> {
 		Some(path) => domains::read_domain_file(path)?,
 		None => domains::default_cold_domains(),
 	};
+	let nxdomain_domains = match &cli.nxdomain_domains {
+		Some(path) => domains::read_domain_file(path)?,
+		None => domains::default_nxdomain_domains(),
+	};
 	let tld_domains = match &cli.tld_domains {
 		Some(path) => domains::read_domain_file(path)?,
 		None => domains::default_tld_domains(),
@@ -90,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
 	}
 
 	// Run NXDOMAIN interception characterization (only on surviving resolvers)
-	bench::run_characterization(&mut resolvers, config.timeout).await;
+	bench::run_characterization(&mut resolvers, config.timeout, &nxdomain_domains).await;
 
 	// Run benchmark
 	println!("Running benchmark...");

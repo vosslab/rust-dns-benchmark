@@ -77,12 +77,17 @@ pub fn stddev(values: &[f64]) -> Option<f64> {
 /// Calculate a set score that balances median latency, tail latency, and reliability.
 ///
 /// Formula: p50 + 0.5 * (p95 - p50) + penalty_ms * timeout_rate
+///
+/// - p50: baseline latency (median)
+/// - 0.5 * (p95 - p50): half-weighted tail penalty to penalize inconsistent resolvers
+/// - penalty_ms * timeout_rate: reliability penalty using full timeout as the cost
 pub fn set_score(stats: &SetStats, timeout_penalty_ms: f64) -> f64 {
 	let timeout_rate = if stats.total_count > 0 {
 		stats.timeout_count as f64 / stats.total_count as f64
 	} else {
 		0.0
 	};
+	// Composite: median + half the tail spread + timeout penalty
 	stats.p50_ms + 0.5 * (stats.p95_ms - stats.p50_ms) + timeout_penalty_ms * timeout_rate
 }
 

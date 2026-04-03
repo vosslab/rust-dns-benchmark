@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-04-02
+
+### Fixes and Maintenance
+- Wired up `--nxdomain-domains` CLI flag to `run_characterization()` so custom NXDOMAIN probe domains are now used instead of a single hardcoded domain (`src/dns.rs`, `src/bench.rs`, `src/main.rs`)
+- Connected `default_nxdomain_domains()` (10 `.invalid` probe domains) as the default when no custom file is provided
+- Refactored `check_nxdomain_interception()` to accept a domain list and probe each domain, improving detection coverage
+- Removed unused `CharacterizationResult` struct from `src/transport.rs` and simplified `run_characterization()` return type to `()`
+- Moved `#[allow(dead_code)]` annotations from struct level to individual unused fields (`answer_count` in `DnsResponse`, `domain`/`query_type`/`rcode` in `QueryResult`)
+- Added inline documentation for the scoring formula in `src/stats.rs::set_score()`
+- Replaced O(n^2) uncertainty lookup in `src/bench.rs` with HashMap-based O(n) lookup
+
+---
+
 ## 2026-02-16 (performance and reliability fixes)
 
 ### Parallel characterization and discovery

@@ -11,7 +11,7 @@ use anyhow::Result;
 use hickory_proto::op::ResponseCode;
 
 use crate::transport::{
-	ResolverConfig, QueryType, QueryResult, BenchmarkConfig, CharacterizationResult,
+	ResolverConfig, QueryType, QueryResult, BenchmarkConfig,
 };
 use crate::dns::{build_query, parse_response, check_nxdomain_interception};
 use crate::stats::{
@@ -137,7 +137,8 @@ struct QueryTask {
 pub async fn run_characterization(
 	resolvers: &mut [ResolverConfig],
 	timeout: Duration,
-) -> Vec<CharacterizationResult> {
+	nxdomain_domains: &[String],
+) {
 	println!("Checking NXDOMAIN interception ({} resolvers)...", resolvers.len());
 
 	// Run all probes concurrently for speed
@@ -149,27 +150,21 @@ pub async fn run_characterization(
 		let label = resolvers[i].label.clone();
 		let sem = semaphore.clone();
 		let timeout = timeout;
+		let domains = nxdomain_domains.to_vec();
 
 		handles.push(tokio::spawn(async move {
 			let _permit = sem.acquire().await.unwrap();
-			let intercepts = check_nxdomain_interception(addr, timeout).await;
+			let intercepts = check_nxdomain_interception(addr, timeout, &domains).await;
 			(i, label, addr, intercepts)
 		}));
 	}
 
-	let mut results = Vec::new();
 	for handle in handles {
 		match handle.await {
 			Ok((idx, label, addr, intercepts)) => {
 				resolvers[idx].intercepts_nxdomain = intercepts;
 				let status = if intercepts { "INTERCEPTS NXDOMAIN" } else { "OK" };
 				println!("  {} ({}): {}", label, addr.ip(), status);
-				results.push(CharacterizationResult {
-					label,
-					addr,
-					intercepts_nxdomain: intercepts,
-					reachable: true,
-				});
 			}
 			Err(e) => {
 				eprintln!("Warning: characterization task failed: {}", e);
@@ -178,7 +173,6 @@ pub async fn run_characterization(
 	}
 
 	println!();
-	results
 }
 
 /// Run discovery prefilter to narrow a large resolver list to the best N.
@@ -562,23 +556,21 @@ pub async fn run_benchmark(
 
 	let mut ranked = rank_resolvers(stats_list);
 
-	// Compute uncertainties and detect ties
-	let mut uncertainties: Vec<f64> = Vec::new();
-	for scored in &ranked {
-		// Find the matching latency data by label
-		let mut found = false;
-		for (i, (ip, _)) in resolver_data.iter().enumerate() {
+	// Build label-to-uncertainty map for O(1) lookup
+	let uncertainty_map: HashMap<String, f64> = resolver_data.iter()
+		.enumerate()
+		.map(|(i, (ip, _))| {
 			let label = label_map.get(ip).cloned().unwrap_or_else(|| ip.clone());
-			if label == scored.stats.label {
-				uncertainties.push(compute_uncertainty(&all_latencies_per_resolver[i]));
-				found = true;
-				break;
-			}
-		}
-		if !found {
-			uncertainties.push(0.0);
-		}
-	}
+			(label, compute_uncertainty(&all_latencies_per_resolver[i]))
+		})
+		.collect();
+
+	// Look up uncertainties in ranked order for tie detection
+	let uncertainties: Vec<f64> = ranked.iter()
+		.map(|scored| {
+			uncertainty_map.get(&scored.stats.label).copied().unwrap_or(0.0)
+		})
+		.collect();
 	detect_ties(&mut ranked, &uncertainties);
 
 	Ok(ranked)

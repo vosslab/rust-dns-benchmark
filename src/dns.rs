@@ -9,10 +9,10 @@ use crate::transport::QueryType;
 
 /// DNS response information extracted from a parsed message
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct DnsResponse {
 	pub rcode: ResponseCode,
 	pub rcode_str: String,
+	#[allow(dead_code)]
 	pub answer_count: usize,
 	/// True if the answer section contains A records
 	pub has_a_records: bool,
@@ -102,8 +102,26 @@ pub fn parse_response(
 pub async fn check_nxdomain_interception(
 	resolver_addr: std::net::SocketAddr,
 	timeout: Duration,
+	nxdomain_domains: &[String],
 ) -> bool {
-	let probe_domain = "nxdomain-test-benchmark-check.invalid";
+	// Query each NXDOMAIN probe domain; if any returns NoError with A records,
+	// the resolver is intercepting
+	for probe_domain in nxdomain_domains {
+		if check_single_nxdomain(resolver_addr, timeout, probe_domain).await {
+			return true;
+		}
+	}
+	false
+}
+
+/// Check a single NXDOMAIN probe domain against a resolver.
+///
+/// Returns true if the resolver intercepts (returns NoError + A records).
+async fn check_single_nxdomain(
+	resolver_addr: std::net::SocketAddr,
+	timeout: Duration,
+	probe_domain: &str,
+) -> bool {
 	let txid: u16 = rand::random();
 
 	let query_bytes = match build_query(probe_domain, QueryType::A, txid, false) {

@@ -85,7 +85,6 @@ pub fn default_cold_domains() -> Vec<String> {
 /// Used for NXDOMAIN interception detection. These use the .invalid TLD
 /// (reserved by RFC 2606) and domains that definitively do not exist.
 /// Available via --nxdomain-domains CLI flag for custom test domains.
-#[allow(dead_code)]
 pub fn default_nxdomain_domains() -> Vec<String> {
 	vec![
 		"nxdomain-test-0001.invalid",

@@ -19,11 +19,13 @@ pub enum QueryType {
 
 /// Result of a single DNS query
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct QueryResult {
 	pub resolver: String,
+	#[allow(dead_code)]
 	pub domain: String,
+	#[allow(dead_code)]
 	pub query_type: QueryType,
+	#[allow(dead_code)]
 	pub rcode: Option<String>,
 	pub latency: Duration,
 	pub success: bool,
@@ -49,14 +51,4 @@ pub struct BenchmarkConfig {
 	pub top_n: usize,
 	/// Maximum resolver latency in ms; resolvers above this are dropped from results
 	pub max_resolver_ms: f64,
-}
-
-/// Result of NXDOMAIN characterization for a single resolver
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct CharacterizationResult {
-	pub label: String,
-	pub addr: SocketAddr,
-	pub intercepts_nxdomain: bool,
-	pub reachable: bool,
 }
