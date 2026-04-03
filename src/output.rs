@@ -74,33 +74,47 @@ pub fn print_config_summary(
 		}
 	}
 
-	// Section 3: Timing and options
-	println!();
-	println!("Timing and options:");
-	println!("  Rounds:           {}", config.rounds);
-	println!("  Bench timeout:    {} ms", config.timeout.as_millis());
-	println!("  Char timeout:     {} ms", crate::transport::DEFAULT_CHAR_TIMEOUT_MS);
-	println!("  Char attempts:    {}", crate::transport::DEFAULT_CHAR_ATTEMPTS);
-	println!("  Concurrency:      {}", config.max_inflight);
-	println!("  Spacing:          {} ms", config.inter_query_spacing.as_millis());
+	// Section 3: Timing and options, organized by phase
 	let aaaa_label = if config.query_aaaa { "yes" } else { "no" };
-	println!("  Query AAAA:       {}", aaaa_label);
 	let dnssec_label = if config.dnssec { "yes" } else { "no" };
-	println!("  DNSSEC (DO):      {}", dnssec_label);
-	println!("  Level:            {}", config.level);
-	if config.discover {
-		println!("  Discovery:        reachability screen ({} ms timeout)", crate::bench::SCREEN_TIMEOUT_MS);
-	}
 	let sort_label = match &config.sort_mode {
 		crate::stats::SortMode::Score => "overall score".to_string(),
 		crate::stats::SortMode::Category(name) => format!("{} p50", name),
 		crate::stats::SortMode::Name => "name".to_string(),
 	};
+
+	println!();
+	println!("Build:              {}", env!("BUILD_TIMESTAMP"));
+	println!();
+	println!("Options:");
+	println!("  Level:            {}", config.level);
+	println!("  Query AAAA:       {}", aaaa_label);
+	println!("  DNSSEC (DO):      {}", dnssec_label);
 	println!("  Sort by:          {}", sort_label);
 	println!("  Pin system:       yes");
 	if let Some(seed) = config.seed {
 		println!("  Seed:             {}", seed);
 	}
+
+	if config.discover {
+		println!();
+		println!("Discovery phase:");
+		println!("  UDP timeout:      {} ms", crate::bench::SCREEN_TIMEOUT_MS);
+		println!("  TLS timeout:      {} ms", crate::bench::SCREEN_TLS_TIMEOUT_MS);
+		println!("  Concurrency:      {}", crate::bench::DISCOVERY_CONCURRENCY.max(config.max_inflight));
+	}
+
+	println!();
+	println!("Characterization phase:");
+	println!("  Timeout:          {} ms", crate::transport::DEFAULT_CHAR_TIMEOUT_MS);
+	println!("  Attempts:         {}", crate::transport::DEFAULT_CHAR_ATTEMPTS);
+
+	println!();
+	println!("Benchmark phase:");
+	println!("  Rounds:           {}", config.rounds);
+	println!("  Timeout:          {} ms", config.timeout.as_millis());
+	println!("  Concurrency:      {}", config.max_inflight);
+	println!("  Spacing:          {} ms", config.inter_query_spacing.as_millis());
 	println!();
 }
 

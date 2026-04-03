@@ -19,8 +19,15 @@ use crate::transport::{
 	DnsTransport, ResolverConfig, QueryType, QueryResult, BenchmarkConfig,
 };
 
-/// Timeout for Phase 1 discovery reachability screen (ms)
+/// Timeout for Phase 1 discovery reachability screen -- UDP (ms)
 pub const SCREEN_TIMEOUT_MS: u64 = 500;
+/// Timeout for Phase 1 discovery reachability screen -- DoT/DoH (ms)
+/// Longer to account for TCP connect + TLS handshake overhead
+pub const SCREEN_TLS_TIMEOUT_MS: u64 = 2000;
+/// Concurrency for discovery screening
+/// 128 is the sweet spot: halves screening time vs 64 without triggering
+/// macOS UDP socket rate limiting (256 causes instant ICMP rejections)
+pub const DISCOVERY_CONCURRENCY: usize = 128;
 use crate::dns::{
 	build_query, parse_response, check_nxdomain_interception,
 	check_rebinding_protection, check_dnssec_validation,
@@ -109,8 +116,9 @@ pub fn spawn_progress_monitor(
 					"--".to_string()
 				}
 			};
-			eprint!("\r  {}: {}/{} ({}%) -- {}",
-				label, done, total, pct, eta_str);
+			// Pad to 80 chars to overwrite any longer previous line
+			let line = format!("  {}: {}/{} ({}%) -- {}", label, done, total, pct, eta_str);
+			eprint!("\r{:<80}", line);
 		}
 	})
 }
@@ -125,7 +133,9 @@ pub fn stop_progress_monitor(
 	monitor.abort();
 	let elapsed_secs = start.elapsed().as_secs();
 	let time_str = format_duration_secs(elapsed_secs);
-	eprint!("\r  {}: {}/{} (100%) -- {}\n", label, total, total, time_str);
+	// Clear entire line first to avoid leftover characters from longer progress text
+	eprint!("\r{:width$}\r", "", width = 80);
+	eprint!("  {}: {}/{} (100%) -- done in {}\n", label, total, total, time_str);
 }
 
 /// Send a single DNS query over UDP and measure latency.
@@ -552,8 +562,15 @@ pub async fn run_characterization(
 	}
 	stop_progress_monitor(monitor, "Reachability", phase0_total, phase0_start);
 
-	// Remove unreachable resolvers
+	// Log reachability results and remove unreachable resolvers
 	let before = resolvers.len();
+	for (i, resolver) in resolvers.iter().enumerate() {
+		if !reachable[i] {
+			config.telemetry.log_sidelined(
+				&resolver.addr.ip().to_string(), "reachability_precheck", 0,
+			);
+		}
+	}
 	let mut idx = 0;
 	resolvers.retain(|_| {
 		let keep = reachable[idx];
@@ -699,6 +716,25 @@ pub async fn run_characterization(
 	println!("  {} validate, {} do not validate, {} unknown",
 		dnssec_validates, dnssec_not, dnssec_unknown);
 
+	// Log characterization summary per resolver
+	for resolver in resolvers.iter() {
+		let nxdomain_str = if resolver.intercepts_nxdomain { "intercepts" } else { "ok" };
+		let rebinding_str = match resolver.rebinding_protection {
+			Some(true) => "protected",
+			Some(false) => "not_protected",
+			None => "unknown",
+		};
+		let dnssec_str = match resolver.validates_dnssec {
+			Some(true) => "validates",
+			Some(false) => "no",
+			None => "unknown",
+		};
+		config.telemetry.log_characterization(
+			&resolver.addr.ip().to_string(), &resolver.label,
+			true, nxdomain_str, rebinding_str, dnssec_str,
+		);
+	}
+
 	println!();
 }
 
@@ -721,12 +757,15 @@ pub async fn run_discovery(
 		.map(|v| v.as_slice())
 		.unwrap_or(&[]);
 
-	// Phase 1: fast parallel reachability screen (1 query, 500ms timeout)
-	let screen_timeout = Duration::from_millis(SCREEN_TIMEOUT_MS);
+	// Phase 1: fast parallel reachability screen (1 query per resolver)
+	let screen_timeout_udp = Duration::from_millis(SCREEN_TIMEOUT_MS);
+	let screen_timeout_tls = Duration::from_millis(SCREEN_TLS_TIMEOUT_MS);
 	let screen_domain = discovery_domains.first()
 		.map(|s| s.as_str())
 		.unwrap_or("google.com");
-	let semaphore = std::sync::Arc::new(Semaphore::new(config.max_inflight));
+	// Discovery uses higher concurrency since it's a simple reachability check
+	let discovery_concurrency = DISCOVERY_CONCURRENCY.max(config.max_inflight);
+	let semaphore = std::sync::Arc::new(Semaphore::new(discovery_concurrency));
 
 	let screen_total = resolvers.len();
 	let screen_done = Arc::new(AtomicUsize::new(0));
@@ -743,6 +782,11 @@ pub async fn run_discovery(
 		let resolver_clone = resolver.clone();
 		let doh_clients = doh_clients.clone();
 		let done = screen_done.clone();
+		// DoT/DoH need longer timeout for TCP + TLS handshake
+		let screen_timeout = match &resolver.transport {
+			DnsTransport::Udp => screen_timeout_udp,
+			_ => screen_timeout_tls,
+		};
 
 		screen_handles.push(tokio::spawn(async move {
 			let _permit = sem.acquire().await.unwrap();
@@ -753,7 +797,7 @@ pub async fn run_discovery(
 				Ok(b) => b,
 				Err(_) => {
 					done.fetch_add(1, Ordering::Relaxed);
-					return (resolver_clone, false);
+					return (resolver_clone, false, true);
 				}
 			};
 			let result = dispatch_query(
@@ -761,15 +805,39 @@ pub async fn run_discovery(
 				txid, &domain, QueryType::A, &doh_clients,
 			).await;
 			done.fetch_add(1, Ordering::Relaxed);
-			(resolver_clone, result.success)
+			(resolver_clone, result.success, result.timeout)
 		}));
 	}
 
 	let mut survivors = Vec::new();
+	let mut panicked = 0usize;
+	let mut timed_out = 0usize;
+	let mut failed_fast = 0usize;
 	for handle in screen_handles {
-		if let Ok((resolver, reachable)) = handle.await {
-			if reachable {
-				survivors.push(resolver);
+		match handle.await {
+			Ok((resolver, reachable, was_timeout)) => {
+				if reachable {
+					config.telemetry.log_discovery(
+						&resolver.addr.ip().to_string(), &resolver.label,
+						true, "reachable",
+					);
+					survivors.push(resolver);
+				} else if was_timeout {
+					config.telemetry.log_discovery(
+						&resolver.addr.ip().to_string(), &resolver.label,
+						false, "timeout",
+					);
+					timed_out += 1;
+				} else {
+					config.telemetry.log_discovery(
+						&resolver.addr.ip().to_string(), &resolver.label,
+						false, "connect_failed",
+					);
+					failed_fast += 1;
+				}
+			}
+			Err(_) => {
+				panicked += 1;
 			}
 		}
 	}
@@ -780,6 +848,13 @@ pub async fn run_discovery(
 		"  Screen: {}/{} resolvers reachable ({} unreachable, dropped)",
 		survivors.len(), resolvers.len(), unreachable,
 	);
+	// Diagnostic breakdown of failures
+	if timed_out > 0 || failed_fast > 0 || panicked > 0 {
+		println!(
+			"  Failures: {} timed out, {} connect failed, {} panicked",
+			timed_out, failed_fast, panicked,
+		);
+	}
 
 	config.telemetry.log_pipeline("discovery_reachable", survivors.len());
 	Ok(survivors)
@@ -913,6 +988,14 @@ pub async fn run_qualification(
 
 	// Take finalists up to budget
 	let promote_count = scored.len().min(finalist_count);
+	// Log qualification scores for all candidates
+	let resolver_labels: HashMap<String, String> = resolvers.iter()
+		.map(|r| (r.addr.ip().to_string(), r.label.clone()))
+		.collect();
+	for (i, (ip, score)) in scored.iter().enumerate() {
+		let label = resolver_labels.get(ip).map(|s| s.as_str()).unwrap_or("");
+		config.telemetry.log_qualification(ip, label, *score, i < promote_count);
+	}
 	let finalist_ips: std::collections::HashSet<String> = scored.into_iter()
 		.take(promote_count)
 		.map(|(ip, _)| ip)

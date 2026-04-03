@@ -163,6 +163,55 @@ impl TelemetryLog {
 	}
 
 	//============================================
+	/// Log a discovery screening outcome for a single resolver.
+	pub fn log_discovery(&self, resolver: &str, label: &str, passed: bool, reason: &str) {
+		let ts = timestamp_iso();
+		let line = format!(
+			r#"{{"event":"discovery","timestamp":"{}","resolver":"{}","label":"{}","passed":{},"reason":"{}"}}"#,
+			ts, json_escape(resolver), json_escape(label), passed, json_escape(reason)
+		);
+		self.write_line(&line);
+	}
+
+	//============================================
+	/// Log a characterization result for a single resolver.
+	pub fn log_characterization(&self, resolver: &str, label: &str,
+		reachable: bool, nxdomain: &str, rebinding: &str, dnssec: &str,
+	) {
+		let ts = timestamp_iso();
+		let line = format!(
+			r#"{{"event":"characterization","timestamp":"{}","resolver":"{}","label":"{}","reachable":{},"nxdomain":"{}","rebinding":"{}","dnssec":"{}"}}"#,
+			ts, json_escape(resolver), json_escape(label), reachable,
+			json_escape(nxdomain), json_escape(rebinding), json_escape(dnssec)
+		);
+		self.write_line(&line);
+	}
+
+	//============================================
+	/// Log a qualification score for a single resolver.
+	pub fn log_qualification(&self, resolver: &str, label: &str,
+		score: f64, promoted: bool,
+	) {
+		let ts = timestamp_iso();
+		let line = format!(
+			r#"{{"event":"qualification","timestamp":"{}","resolver":"{}","label":"{}","score":{:.1},"promoted":{}}}"#,
+			ts, json_escape(resolver), json_escape(label), score, promoted
+		);
+		self.write_line(&line);
+	}
+
+	//============================================
+	/// Log a per-resolver phase timing.
+	pub fn log_phase(&self, phase: &str, elapsed_secs: u64, before: usize, after: usize) {
+		let ts = timestamp_iso();
+		let line = format!(
+			r#"{{"event":"phase","timestamp":"{}","phase":"{}","elapsed_secs":{},"before":{},"after":{}}}"#,
+			ts, json_escape(phase), elapsed_secs, before, after
+		);
+		self.write_line(&line);
+	}
+
+	//============================================
 	/// Log a final result entry.
 	pub fn log_result(&self, rank: usize, resolver: &str, label: &str, score: f64, p50_ms: f64) {
 		let ts = timestamp_iso();

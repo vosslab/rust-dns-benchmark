@@ -448,7 +448,18 @@ pub async fn download_exhaustive_csv() -> Result<Vec<ResolverConfig>> {
 		});
 	}
 
-	println!("  Parsed {} resolvers from CSV (filtered reliability >= 0.5)", resolvers.len());
+	let ipv4_count = resolvers.iter().filter(|r| r.addr.is_ipv4()).count();
+	let ipv6_count = resolvers.iter().filter(|r| r.addr.is_ipv6()).count();
+	let ipv4_pct = if resolvers.is_empty() { 0.0 } else { 100.0 * ipv4_count as f64 / resolvers.len() as f64 };
+	let ipv6_pct = if resolvers.is_empty() { 0.0 } else { 100.0 * ipv6_count as f64 / resolvers.len() as f64 };
+	println!(
+		"  Parsed {} resolvers from CSV (filtered reliability >= 0.5)",
+		resolvers.len(),
+	);
+	println!(
+		"  IPv4: {} ({:.1}%), IPv6: {} ({:.1}%)",
+		ipv4_count, ipv4_pct, ipv6_count, ipv6_pct,
+	);
 	Ok(resolvers)
 }
 

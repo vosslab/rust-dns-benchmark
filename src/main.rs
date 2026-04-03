@@ -50,6 +50,10 @@ fn error_to_exit_code(msg: &str) -> u8 {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+	// Install the rustls ring crypto provider before any TLS connections
+	rustls::crypto::ring::default_provider()
+		.install_default()
+		.expect("Failed to install rustls crypto provider");
 	match run().await {
 		Ok(()) => ExitCode::from(0),
 		Err(e) => {
@@ -200,7 +204,9 @@ async fn run() -> anyhow::Result<()> {
 		resolvers = bench::run_discovery(
 			&resolvers, &categories, &config, &doh_clients,
 		).await?;
-		phase_timings.push(("Discovery", phase_start.elapsed(), Some((before, resolvers.len()))));
+		let discovery_elapsed = phase_start.elapsed();
+		config.telemetry.log_phase("discovery", discovery_elapsed.as_secs(), before, resolvers.len());
+		phase_timings.push(("Discovery", discovery_elapsed, Some((before, resolvers.len()))));
 		println!();
 	}
 
@@ -212,7 +218,9 @@ async fn run() -> anyhow::Result<()> {
 	let char_before = resolvers.len();
 	rdns::resolve_ptr_names(&mut resolvers, config.timeout).await;
 	bench::run_characterization(&mut resolvers, &config, &nxdomain_domains).await;
-	phase_timings.push(("Characterization", char_phase_start.elapsed(), Some((char_before, resolvers.len()))));
+	let char_elapsed = char_phase_start.elapsed();
+	config.telemetry.log_phase("characterization", char_elapsed.as_secs(), char_before, resolvers.len());
+	phase_timings.push(("Characterization", char_elapsed, Some((char_before, resolvers.len()))));
 
 	let post_char_count = resolvers.len();
 	config.telemetry.log_pipeline("after_characterization", post_char_count);

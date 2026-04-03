@@ -8,6 +8,15 @@
 - Extracted reusable `spawn_progress_monitor()` and `stop_progress_monitor()` helpers in `src/bench.rs`
 - ETA display uses conservative 20% padding and rounds up to reduce jitter (5s buckets under 60s, 15s buckets under 10m, 30s buckets over 10m)
 
+### Fixes and Maintenance
+- Fixed repeated rustls CryptoProvider panic on tokio worker threads by installing ring provider at startup in `src/main.rs`
+- Set discovery concurrency to 128 (halves screening time vs 64; 256 triggered macOS UDP socket rate limiting)
+- Reorganized config summary output by phase (Options, Discovery, Characterization, Benchmark) instead of a flat list
+- Added separate TLS timeout (2000 ms) for DoT/DoH resolvers during discovery screening; UDP stays at 500 ms
+- Progress monitors now print "done in X" at completion instead of bare elapsed time
+- Added compile-time build timestamp to config summary via `build.rs`
+- Expanded JSONL telemetry: per-resolver discovery outcomes (pass/timeout/connect_failed), characterization summaries (reachable/nxdomain/rebinding/dnssec), qualification scores with promoted flag, sidelined resolvers from reachability precheck, and phase timing events
+
 ### Behavior or Interface Changes
 - Discovery line now shows the screening timeout: `Discovery: reachability screen (500 ms timeout)` to clarify that screening uses a shorter timeout than the configured benchmark timeout
 - Extracted `SCREEN_TIMEOUT_MS` constant in `src/bench.rs` (was hardcoded 500ms)
