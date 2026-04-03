@@ -10,7 +10,7 @@ pub const DEFAULT_CONCURRENCY: usize = 64;
 pub const DEFAULT_SPACING_MS: u64 = 25;
 pub const DEFAULT_MAX_RESOLVER_MS: f64 = 1000.0;
 pub const DEFAULT_SIDELINE_MS: f64 = 500.0;
-pub const DEFAULT_CHAR_TIMEOUT_MS: u64 = 50;
+pub const DEFAULT_CHAR_TIMEOUT_MS: u64 = 100;
 pub const DEFAULT_CHAR_ATTEMPTS: u32 = 10;
 pub const DEFAULT_QUERY_AAAA: bool = true;
 pub const DEFAULT_DNSSEC: bool = true;
@@ -21,8 +21,8 @@ pub const DEFAULT_QUICK_ROUNDS: u32 = 3;
 pub const DEFAULT_MEDIUM_ROUNDS: u32 = 5;
 pub const DEFAULT_SLOW_ROUNDS: u32 = 7;
 pub const DEFAULT_EXHAUSTIVE_ROUNDS: u32 = 30;
-// Medium mode: max finalists promoted from qualification
-pub const DEFAULT_MEDIUM_FINALIST_COUNT: usize = 200;
+// Medium mode: max resolvers promoted from qualification to full benchmark
+pub const DEFAULT_MEDIUM_BUDGET: usize = 200;
 // Slow mode: purge ratio and minimum finalist floor
 pub const DEFAULT_SLOW_PURGE_RATIO: f64 = 0.5;
 pub const DEFAULT_SLOW_FINALIST_MIN: usize = 250;
@@ -77,6 +77,34 @@ pub struct ResolverConfig {
 	pub as_org: Option<String>,
 	/// Reliability score (0.0-1.0) from public-dns.info
 	pub reliability: Option<f64>,
+}
+
+//============================================
+/// Classify a resolver IP as "system", "private" (RFC1918), or "public".
+/// Used for diagnostic tagging in telemetry, not for promotion decisions.
+pub fn resolver_class(resolver: &ResolverConfig) -> &'static str {
+	if resolver.is_system {
+		return "system";
+	}
+	match resolver.addr.ip() {
+		std::net::IpAddr::V4(ip) => {
+			let octets = ip.octets();
+			// 10.0.0.0/8
+			if octets[0] == 10 {
+				return "private";
+			}
+			// 172.16.0.0/12
+			if octets[0] == 172 && (16..=31).contains(&octets[1]) {
+				return "private";
+			}
+			// 192.168.0.0/16
+			if octets[0] == 192 && octets[1] == 168 {
+				return "private";
+			}
+			"public"
+		}
+		std::net::IpAddr::V6(_) => "public",
+	}
 }
 
 /// DNS query type

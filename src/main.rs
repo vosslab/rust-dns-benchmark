@@ -294,14 +294,22 @@ async fn run() -> anyhow::Result<()> {
 		r.tie_group = None;
 	}
 
-	// Log final results to telemetry
+	// Log final results to telemetry with full per-category breakdown
 	for r in &results {
-		// Use first category for telemetry score/p50
-		let (score, p50) = first_cat.as_ref()
-			.and_then(|cat| r.stats.categories.get(cat))
-			.map(|s| (s.score, s.p50_ms))
-			.unwrap_or((r.stats.overall_score, 0.0));
-		config.telemetry.log_result(r.rank, &r.stats.addr, &r.stats.label, score, p50);
+		// Build JSON object with per-category stats
+		let cat_entries: Vec<String> = r.stats.categories.iter()
+			.map(|(name, stats)| {
+				format!(
+					r#""{}": {{"p50_ms":{:.1},"score":{:.1},"success":{},"total":{},"timeouts":{}}}"#,
+					name, stats.p50_ms, stats.score, stats.success_count, stats.total_count, stats.timeout_count,
+				)
+			})
+			.collect();
+		let categories_json = format!("{{{}}}", cat_entries.join(","));
+		config.telemetry.log_result_detail(
+			r.rank, &r.stats.addr, &r.stats.label,
+			r.stats.overall_score, r.stats.success_rate, &categories_json,
+		);
 	}
 
 	// Print pipeline summary

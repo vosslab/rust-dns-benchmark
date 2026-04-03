@@ -109,6 +109,12 @@ pub fn print_config_summary(
 	println!("  Timeout:          {} ms", crate::transport::DEFAULT_CHAR_TIMEOUT_MS);
 	println!("  Attempts:         {}", crate::transport::DEFAULT_CHAR_ATTEMPTS);
 
+	if config.level == crate::cli::BenchLevel::Medium {
+		println!();
+		println!("Qualification phase:");
+		println!("  Budget:           {}", crate::transport::DEFAULT_MEDIUM_BUDGET);
+	}
+
 	println!();
 	println!("Benchmark phase:");
 	println!("  Rounds:           {}", config.rounds);

@@ -17,6 +17,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::transport::{
 	DnsTransport, ResolverConfig, QueryType, QueryResult, BenchmarkConfig,
+	resolver_class,
 };
 
 /// Timeout for Phase 1 discovery reachability screen -- UDP (ms)
@@ -569,6 +570,11 @@ pub async fn run_characterization(
 			config.telemetry.log_sidelined(
 				&resolver.addr.ip().to_string(), "reachability_precheck", 0,
 			);
+			let class = resolver_class(resolver);
+			if class != "public" {
+				println!("  {} {} ({}) -- sidelined (reachability precheck)",
+					class, resolver.label, resolver.addr.ip());
+			}
 		}
 	}
 	let mut idx = 0;
@@ -729,8 +735,9 @@ pub async fn run_characterization(
 			Some(false) => "no",
 			None => "unknown",
 		};
+		let class = resolver_class(resolver);
 		config.telemetry.log_characterization(
-			&resolver.addr.ip().to_string(), &resolver.label,
+			&resolver.addr.ip().to_string(), &resolver.label, class,
 			true, nxdomain_str, rebinding_str, dnssec_str,
 		);
 	}
@@ -777,7 +784,9 @@ pub async fn run_discovery(
 	let mut screen_handles = Vec::new();
 	for resolver in resolvers {
 		let sem = semaphore.clone();
-		let dnssec = config.dnssec;
+		// Discovery is a reachability check only -- skip DNSSEC DO bit
+		// to keep queries small and avoid larger EDNS responses under load
+		let dnssec = false;
 		let domain = screen_domain.to_string();
 		let resolver_clone = resolver.clone();
 		let doh_clients = doh_clients.clone();
@@ -816,24 +825,25 @@ pub async fn run_discovery(
 	for handle in screen_handles {
 		match handle.await {
 			Ok((resolver, reachable, was_timeout)) => {
+				let class = resolver_class(&resolver);
 				if reachable {
 					config.telemetry.log_discovery(
 						&resolver.addr.ip().to_string(), &resolver.label,
-						true, "reachable",
+						class, true, "reachable",
 					);
 					survivors.push(resolver);
-				} else if was_timeout {
-					config.telemetry.log_discovery(
-						&resolver.addr.ip().to_string(), &resolver.label,
-						false, "timeout",
-					);
-					timed_out += 1;
 				} else {
+					let reason = if was_timeout { "timeout" } else { "connect_failed" };
 					config.telemetry.log_discovery(
 						&resolver.addr.ip().to_string(), &resolver.label,
-						false, "connect_failed",
+						class, false, reason,
 					);
-					failed_fast += 1;
+					// Print private/system resolver failures to stdout
+					if class != "public" {
+						println!("  {} {} ({}) -- {}",
+							class, resolver.label, resolver.addr.ip(), reason);
+					}
+					if was_timeout { timed_out += 1; } else { failed_fast += 1; }
 				}
 			}
 			Err(_) => {
@@ -871,7 +881,6 @@ pub async fn run_qualification(
 	config: &BenchmarkConfig,
 	doh_clients: &DohClientPool,
 ) -> Result<Vec<ResolverConfig>> {
-	let finalist_count = crate::transport::DEFAULT_MEDIUM_FINALIST_COUNT;
 	println!("Qualification pass: scoring {} resolvers...", resolvers.len());
 
 	// Build a small domain set: up to 3 cached, 5 uncached, 2 from other categories
@@ -986,17 +995,34 @@ pub async fn run_qualification(
 	// Sort by score (lower = better)
 	scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-	// Take finalists up to budget
-	let promote_count = scored.len().min(finalist_count);
-	// Log qualification scores for all candidates
+	// Promote up to the benchmark budget, ranked by qualification score
+	let budget = crate::transport::DEFAULT_MEDIUM_BUDGET;
 	let resolver_labels: HashMap<String, String> = resolvers.iter()
 		.map(|r| (r.addr.ip().to_string(), r.label.clone()))
 		.collect();
+	let promote_count = scored.iter()
+		.filter(|(_, s)| s.is_finite())
+		.count()
+		.min(budget);
+	// Build class map for telemetry tagging
+	let resolver_classes: HashMap<String, &str> = resolvers.iter()
+		.map(|r| (r.addr.ip().to_string(), resolver_class(r)))
+		.collect();
+	// Log all candidates with promoted flag
 	for (i, (ip, score)) in scored.iter().enumerate() {
 		let label = resolver_labels.get(ip).map(|s| s.as_str()).unwrap_or("");
-		config.telemetry.log_qualification(ip, label, *score, i < promote_count);
+		let class = resolver_classes.get(ip).copied().unwrap_or("public");
+		let promoted = score.is_finite() && i < promote_count;
+		config.telemetry.log_qualification(ip, label, class, *score, promoted);
+		// Print private/system resolver qualification to stdout
+		if class != "public" {
+			let status = if promoted { "promoted" } else { "not promoted" };
+			println!("  {} {} ({}) -- score {:.1}, {} (rank {}/{})",
+				class, label, ip, score, status, i + 1, scored.len());
+		}
 	}
 	let finalist_ips: std::collections::HashSet<String> = scored.into_iter()
+		.filter(|(_, s)| s.is_finite())
 		.take(promote_count)
 		.map(|(ip, _)| ip)
 		.collect();
@@ -1006,8 +1032,8 @@ pub async fn run_qualification(
 		.cloned()
 		.collect();
 
-	println!("  Promoted {} finalists from {} candidates for full benchmark",
-		finalists.len(), resolvers.len());
+	println!("  Promoted {} finalists from {} candidates (budget {})",
+		finalists.len(), resolvers.len(), budget);
 
 	Ok(finalists)
 }
@@ -1238,6 +1264,35 @@ pub async fn run_benchmark(
 			})
 			.count();
 		config.telemetry.log_round_complete(round + 1, round_total, round_failures);
+
+		// Log per-resolver stats for this round
+		{
+			let mut round_stats: HashMap<String, (usize, usize, usize, Vec<f64>)> = HashMap::new();
+			for (task, result) in &all_results {
+				let ip = task.resolver.addr.ip().to_string();
+				if sidelined.contains(&ip) { continue; }
+				// Only count results from the current round
+				let entry = round_stats.entry(ip).or_insert((0, 0, 0, Vec::new()));
+				entry.0 += 1; // queries
+				if result.success {
+					entry.1 += 1; // successes
+					entry.3.push(result.latency.as_secs_f64() * 1000.0);
+				}
+				if result.timeout { entry.2 += 1; } // timeouts
+			}
+			for (ip, (queries, successes, timeouts, latencies)) in &round_stats {
+				let p50 = if latencies.is_empty() {
+					0.0
+				} else {
+					let mut sorted = latencies.clone();
+					sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+					sorted[sorted.len() / 2]
+				};
+				config.telemetry.log_round_resolver(
+					round + 1, ip, *queries, *successes, *timeouts, p50,
+				);
+			}
+		}
 
 		// Mid-benchmark sidelining: check for slow/dead resolvers after each round
 		if round < config.rounds - 1 {

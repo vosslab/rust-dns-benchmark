@@ -15,7 +15,14 @@
 - Added separate TLS timeout (2000 ms) for DoT/DoH resolvers during discovery screening; UDP stays at 500 ms
 - Progress monitors now print "done in X" at completion instead of bare elapsed time
 - Added compile-time build timestamp to config summary via `build.rs`
-- Expanded JSONL telemetry: per-resolver discovery outcomes (pass/timeout/connect_failed), characterization summaries (reachable/nxdomain/rebinding/dnssec), qualification scores with promoted flag, sidelined resolvers from reachability precheck, and phase timing events
+- Expanded JSONL telemetry with per-resolver detail at every phase: discovery outcomes, reachability precheck sidelining, characterization summaries, qualification scores, per-round per-resolver stats (queries/successes/timeouts/p50), phase timings, and final results with full per-category breakdown (p50/score/success/total/timeouts)
+- Disabled DNSSEC DO bit for discovery screening since it is a reachability check only; smaller queries improve reliability under concurrent load
+- Increased characterization reachability timeout from 50ms to 100ms to accommodate resolvers with 25-30ms base latency under jitter
+- Redesigned medium mode as qualification-driven finalists: discovery + characterization + qualification scoring + budget-capped promotion (default 200) + full benchmark rounds on finalists only
+- Replaced hard top-N cutoff with budget framing: "promote up to benchmark budget" instead of "top 200 resolvers"
+- Config summary now shows qualification budget for medium mode
+- Added RFC1918 private resolver tracking: resolvers classified as `public`, `private`, or `system` with class field in all JSONL telemetry events (discovery, characterization, qualification)
+- Private and system resolver failures now print to stdout at each phase (discovery drops, reachability sidelining, qualification rank and promotion status)
 
 ### Behavior or Interface Changes
 - Discovery line now shows the screening timeout: `Discovery: reachability screen (500 ms timeout)` to clarify that screening uses a shorter timeout than the configured benchmark timeout
