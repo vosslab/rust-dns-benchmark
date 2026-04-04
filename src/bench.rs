@@ -794,12 +794,12 @@ pub async fn run_characterization(
 /// Phase 1: fast parallel screen with 1 query per resolver (500ms timeout).
 /// Phase 2: parallel warm-only benchmark on survivors, keep top N by p50.
 pub async fn run_discovery(
-	resolvers: &[Resolver],
+	records: &mut [crate::record::ResolverRecord],
 	categories: &std::collections::BTreeMap<String, Vec<String>>,
 	config: &BenchmarkConfig,
 	doh_clients: &DohClientPool,
-) -> Result<Vec<Resolver>> {
-	println!("Discovery mode: screening {} resolvers...", resolvers.len());
+) {
+	println!("Discovery mode: screening {} resolvers...", records.len());
 
 	// Pick discovery domains from the first category with enough entries
 	let discovery_domains: &[String] = categories.values()
@@ -818,25 +818,23 @@ pub async fn run_discovery(
 	let discovery_concurrency = DISCOVERY_CONCURRENCY.max(config.max_inflight);
 	let semaphore = std::sync::Arc::new(Semaphore::new(discovery_concurrency));
 
-	let screen_total = resolvers.len();
+	let screen_total = records.len();
 	let screen_done = Arc::new(AtomicUsize::new(0));
 	let screen_start = Instant::now();
 	let monitor = spawn_progress_monitor(
 		"Screening".to_string(), screen_done.clone(), screen_total, screen_start,
 	);
 
+	// Spawn async tasks keyed by index
 	let mut screen_handles = Vec::new();
-	for resolver in resolvers {
+	for (i, rec) in records.iter().enumerate() {
 		let sem = semaphore.clone();
-		// Discovery is a reachability check only -- skip DNSSEC DO bit
-		// to keep queries small and avoid larger EDNS responses under load
 		let dnssec = false;
 		let domain = screen_domain.to_string();
-		let resolver_clone = resolver.clone();
+		let resolver_clone = rec.resolver.clone();
 		let doh_clients = doh_clients.clone();
 		let done = screen_done.clone();
-		// DoT/DoH need longer timeout for TCP + TLS handshake
-		let screen_timeout = match &resolver.transport {
+		let screen_timeout = match &rec.resolver.transport {
 			DnsTransport::Udp => screen_timeout_udp,
 			_ => screen_timeout_tls,
 		};
@@ -850,7 +848,7 @@ pub async fn run_discovery(
 				Ok(b) => b,
 				Err(_) => {
 					done.fetch_add(1, Ordering::Relaxed);
-					return (resolver_clone, false, true, 0.0);
+					return (i, resolver_clone, false, true, 0.0);
 				}
 			};
 			let result = dispatch_query(
@@ -859,30 +857,41 @@ pub async fn run_discovery(
 			).await;
 			let latency_ms = result.latency.as_secs_f64() * 1000.0;
 			done.fetch_add(1, Ordering::Relaxed);
-			(resolver_clone, result.success, result.timeout, latency_ms)
+			(i, resolver_clone, result.success, result.timeout, latency_ms)
 		}));
 	}
 
-	let mut survivors = Vec::new();
+	// Collect results and write DiscoveryResult on each record
+	let mut passed_count = 0usize;
 	let mut panicked = 0usize;
 	let mut timed_out = 0usize;
 	let mut failed_fast = 0usize;
 	for handle in screen_handles {
 		match handle.await {
-			Ok((resolver, reachable, was_timeout, latency_ms)) => {
+			Ok((idx, resolver, reachable, was_timeout, latency_ms)) => {
 				let class = resolver.class;
 				if reachable {
 					config.telemetry.log_discovery(
 						&resolver.addr.ip().to_string(), &resolver.label,
 						class, true, "reachable", latency_ms,
 					);
-					survivors.push(resolver);
+					records[idx].discovery = Some(crate::record::DiscoveryResult {
+						passed: true,
+						latency_ms: Some(latency_ms),
+						reason: "reachable".to_string(),
+					});
+					passed_count += 1;
 				} else {
 					let reason = if was_timeout { "timeout" } else { "connect_failed" };
 					config.telemetry.log_discovery(
 						&resolver.addr.ip().to_string(), &resolver.label,
 						class, false, reason, latency_ms,
 					);
+					records[idx].discovery = Some(crate::record::DiscoveryResult {
+						passed: false,
+						latency_ms: if latency_ms > 0.0 { Some(latency_ms) } else { None },
+						reason: reason.to_string(),
+					});
 					// Print private/system resolver failures to stdout
 					if class != "public" {
 						println!("  {} {} ({}) -- {}",
@@ -898,12 +907,11 @@ pub async fn run_discovery(
 	}
 	stop_progress_monitor(monitor, "Screening", screen_total, screen_start);
 
-	let unreachable = resolvers.len() - survivors.len();
+	let unreachable = screen_total - passed_count;
 	println!(
 		"  Screen: {}/{} resolvers reachable ({} unreachable, dropped)",
-		survivors.len(), resolvers.len(), unreachable,
+		passed_count, screen_total, unreachable,
 	);
-	// Diagnostic breakdown of failures
 	if timed_out > 0 || failed_fast > 0 || panicked > 0 {
 		println!(
 			"  Failures: {} timed out, {} connect failed, {} panicked",
@@ -911,22 +919,20 @@ pub async fn run_discovery(
 		);
 	}
 
-	config.telemetry.log_pipeline("discovery_reachable", survivors.len());
-	Ok(survivors)
+	config.telemetry.log_pipeline("discovery_reachable", passed_count);
 }
 
 /// Run a lightweight qualification pass to select finalists for medium mode.
 ///
-/// Sends a small number of queries per resolver (cached + uncached + NXDOMAIN)
-/// and scores by median latency, variance, timeout rate, and correctness.
-/// Returns the most promising candidates up to the finalist budget.
+/// Writes QualificationResult on each record with real scores.
+/// Caller is responsible for retaining only promoted records.
 pub async fn run_qualification(
-	resolvers: &[Resolver],
+	records: &mut [crate::record::ResolverRecord],
 	categories: &std::collections::BTreeMap<String, Vec<String>>,
 	config: &BenchmarkConfig,
 	doh_clients: &DohClientPool,
-) -> Result<Vec<Resolver>> {
-	println!("Qualification pass: scoring {} resolvers...", resolvers.len());
+) {
+	println!("Qualification pass: scoring {} resolvers...", records.len());
 
 	// Build a small domain set: up to 3 cached, 5 uncached, 2 from other categories
 	let mut qual_domains: Vec<String> = Vec::new();
@@ -936,14 +942,12 @@ pub async fn run_qualification(
 	if let Some(uncached) = categories.get("uncached") {
 		qual_domains.extend(uncached.iter().take(5).cloned());
 	}
-	// Add 2 from any other category for diversity
 	for (name, domains) in categories {
 		if name != "cached" && name != "uncached" && qual_domains.len() < 12 {
 			qual_domains.extend(domains.iter().take(2).cloned());
 		}
 	}
 	if qual_domains.is_empty() {
-		// Fallback if no categories available
 		qual_domains.push("google.com".to_string());
 	}
 
@@ -952,20 +956,19 @@ pub async fn run_qualification(
 	let semaphore = std::sync::Arc::new(Semaphore::new(config.max_inflight));
 	let timeout = config.timeout;
 
-	// Total tasks = resolvers * domains
-	let qual_total = resolvers.len() * qual_domains.len();
+	let qual_total = records.len() * qual_domains.len();
 	let qual_done = Arc::new(AtomicUsize::new(0));
 	let qual_start = Instant::now();
 	let monitor = spawn_progress_monitor(
 		"Qualifying".to_string(), qual_done.clone(), qual_total, qual_start,
 	);
 
-	// Run qualification queries
+	// Run qualification queries -- clone resolver for each async task
 	let mut handles = Vec::new();
-	for resolver in resolvers {
+	for rec in records.iter() {
 		for domain in &qual_domains {
 			let sem = semaphore.clone();
-			let resolver_clone = resolver.clone();
+			let resolver_clone = rec.resolver.clone();
 			let dnssec = config.dnssec;
 			let domain_clone = domain.clone();
 			let doh_clients = doh_clients.clone();
@@ -980,7 +983,7 @@ pub async fn run_qualification(
 					Ok(b) => b,
 					Err(_) => {
 						done.fetch_add(1, Ordering::Relaxed);
-						return (resolver_clone.addr.ip().to_string(), None, true);
+						return (resolver_clone.addr.ip(), None, true);
 					}
 				};
 				let result = dispatch_query(
@@ -990,40 +993,38 @@ pub async fn run_qualification(
 				done.fetch_add(1, Ordering::Relaxed);
 				if result.success {
 					let latency_ms = result.latency.as_secs_f64() * 1000.0;
-					(resolver_clone.addr.ip().to_string(), Some(latency_ms), false)
+					(resolver_clone.addr.ip(), Some(latency_ms), false)
 				} else {
-					(resolver_clone.addr.ip().to_string(), None, result.timeout)
+					(resolver_clone.addr.ip(), None, result.timeout)
 				}
 			}));
 		}
 	}
 
-	// Collect results per resolver
-	let mut resolver_data: HashMap<String, (Vec<f64>, usize, usize)> = HashMap::new();
+	// Collect results per resolver IP
+	let mut resolver_data: HashMap<std::net::IpAddr, (Vec<f64>, usize, usize)> = HashMap::new();
 	for handle in handles {
 		if let Ok((ip, latency, is_timeout)) = handle.await {
 			let entry = resolver_data.entry(ip).or_insert_with(|| (Vec::new(), 0, 0));
-			entry.1 += 1; // total queries
+			entry.1 += 1;
 			if let Some(lat) = latency {
 				entry.0.push(lat);
 			}
 			if is_timeout {
-				entry.2 += 1; // timeout count
+				entry.2 += 1;
 			}
 		}
 	}
 	stop_progress_monitor(monitor, "Qualifying", qual_total, qual_start);
 
 	// Score each resolver: lower is better
-	// Score = median_latency + (variance_penalty) + (timeout_penalty)
+	// Score = median_latency + variance_penalty + timeout_penalty
 	let timeout_penalty_ms = config.timeout.as_millis() as f64;
-	// Score each resolver and capture components for logging
-	// Tuple: (ip, score, p50_ms, stddev_ms, timeout_rate)
-	let mut scored: Vec<(String, f64, f64, f64, f64)> = resolver_data.iter()
+	let mut scored: Vec<(std::net::IpAddr, f64, f64, f64, f64)> = resolver_data.iter()
 		.map(|(ip, (latencies, total, timeouts))| {
 			let timeout_rate = *timeouts as f64 / *total as f64;
 			if latencies.is_empty() {
-				return (ip.clone(), f64::INFINITY, 0.0, 0.0, timeout_rate);
+				return (*ip, f64::INFINITY, 0.0, 0.0, timeout_rate);
 			}
 			let mut sorted = latencies.clone();
 			sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -1032,95 +1033,67 @@ pub async fn run_qualification(
 			let variance = sorted.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / sorted.len() as f64;
 			let stddev = variance.sqrt();
 			let score = median + stddev + (timeout_rate * timeout_penalty_ms);
-			(ip.clone(), score, median, stddev, timeout_rate)
+			(*ip, score, median, stddev, timeout_rate)
 		})
 		.collect();
 
 	// Sort by score (lower = better)
 	scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-	// Promote up to the benchmark budget, ranked by qualification score
+	// Determine promotion threshold
 	let budget = crate::transport::DEFAULT_MEDIUM_BUDGET;
-	// Build config map for metadata lookups
-	let qual_config_map: HashMap<String, &Resolver> = resolvers.iter()
-		.map(|r| (r.addr.ip().to_string(), r))
-		.collect();
 	let promote_count = scored.iter()
 		.filter(|(_, s, _, _, _)| s.is_finite())
 		.count()
 		.min(budget);
-	// Log all candidates with promoted flag and score components
+
+	// Build score lookup by IP for writing onto records
+	let score_map: HashMap<std::net::IpAddr, (f64, f64, f64, f64, bool)> = scored.iter()
+		.enumerate()
+		.map(|(i, (ip, score, p50, stddev, timeout_rate))| {
+			let promoted = score.is_finite() && i < promote_count;
+			(*ip, (*score, *p50, *stddev, *timeout_rate, promoted))
+		})
+		.collect();
+
+	// Log all candidates and write QualificationResult onto each record
+	let total_candidates = records.len();
 	for (i, (ip, score, p50, stddev, timeout_rate)) in scored.iter().enumerate() {
-		let cfg = qual_config_map.get(ip);
-		let label = cfg.map(|r| r.label.as_str()).unwrap_or("");
-		let class = cfg.map(|r| r.class).unwrap_or("public");
 		let promoted = score.is_finite() && i < promote_count;
-		config.telemetry.log_qualification(
-			ip, label, class, *score, promoted,
-			*p50, *stddev, *timeout_rate,
-		);
-		// Print private/system resolver qualification to stdout
-		if class != "public" {
-			let status = if promoted { "promoted" } else { "not promoted" };
-			println!("  {} {} ({}) -- score {:.1}, p50 {:.1} ms, {} (rank {}/{})",
-				class, label, ip, score, p50, status, i + 1, scored.len());
+		// Find the record for telemetry logging
+		if let Some(rec) = records.iter().find(|r| r.resolver.addr.ip() == *ip) {
+			config.telemetry.log_qualification(
+				&ip.to_string(), &rec.resolver.label, rec.resolver.class,
+				*score, promoted, *p50, *stddev, *timeout_rate,
+			);
+			if rec.resolver.class != "public" {
+				let status = if promoted { "promoted" } else { "not promoted" };
+				println!("  {} {} ({}) -- score {:.1}, p50 {:.1} ms, {} (rank {}/{})",
+					rec.resolver.class, rec.resolver.label, ip, score, p50, status,
+					i + 1, scored.len());
+			}
 		}
 	}
-	let finalist_ips: std::collections::HashSet<String> = scored.into_iter()
-		.filter(|(_, s, _, _, _)| s.is_finite())
-		.take(promote_count)
-		.map(|(ip, _, _, _, _)| ip)
-		.collect();
 
-	let finalists: Vec<Resolver> = resolvers.iter()
-		.filter(|r| finalist_ips.contains(&r.addr.ip().to_string()))
-		.cloned()
-		.collect();
-
-	println!("  Promoted {} finalists from {} candidates (budget {})",
-		finalists.len(), resolvers.len(), budget);
-
-	Ok(finalists)
-}
-
-//============================================
-/// Record-native wrapper for run_qualification.
-/// Takes Vec<ResolverRecord>, runs qualification on the resolvers,
-/// writes QualificationResult onto each record, and returns promoted records.
-pub async fn run_qualification_records(
-	mut records: Vec<crate::record::ResolverRecord>,
-	categories: &std::collections::BTreeMap<String, Vec<String>>,
-	config: &BenchmarkConfig,
-	doh_clients: &DohClientPool,
-) -> Result<Vec<crate::record::ResolverRecord>> {
-	// Extract resolvers for the existing qualification logic
-	let resolvers: Vec<Resolver> = records.iter().map(|r| r.resolver.clone()).collect();
-	let finalists = run_qualification(&resolvers, categories, config, doh_clients).await?;
-
-	// Build set of promoted IPs
-	let finalist_ips: std::collections::HashSet<String> = finalists.iter()
-		.map(|r| r.addr.ip().to_string())
-		.collect();
-
-	// Write qualification results onto records
+	// Write QualificationResult on each record
 	for rec in records.iter_mut() {
-		let ip = rec.resolver.addr.ip().to_string();
-		let promoted = finalist_ips.contains(&ip);
-		rec.qualification = Some(crate::record::QualificationResult {
-			score: 0.0,
-			promoted,
-			p50_ms: 0.0,
-			stddev_ms: 0.0,
-			timeout_rate: 0.0,
-		});
+		let ip = rec.resolver.addr.ip();
+		if let Some((score, p50, stddev, timeout_rate, promoted)) = score_map.get(&ip) {
+			rec.qualification = Some(crate::record::QualificationResult {
+				score: *score,
+				promoted: *promoted,
+				p50_ms: *p50,
+				stddev_ms: *stddev,
+				timeout_rate: *timeout_rate,
+			});
+		}
 	}
 
-	// Filter to promoted records only
-	records.retain(|r| {
-		r.qualification.as_ref().map(|q| q.promoted).unwrap_or(false)
-	});
-
-	Ok(records)
+	let promoted_count = records.iter()
+		.filter(|r| r.qualification.as_ref().map_or(false, |q| q.promoted))
+		.count();
+	println!("  Promoted {} finalists from {} candidates (budget {})",
+		promoted_count, total_candidates, budget);
 }
 
 /// Run a staged elimination benchmark for slow mode.
@@ -1129,72 +1102,62 @@ pub async fn run_qualification_records(
 /// until the finalist floor is reached, then runs remaining rounds
 /// on the final set.
 pub async fn run_staged_benchmark(
-	resolvers: &[Resolver],
+	records: &mut Vec<crate::record::ResolverRecord>,
 	categories: &std::collections::BTreeMap<String, Vec<String>>,
 	config: &BenchmarkConfig,
 	doh_clients: &DohClientPool,
-) -> Result<Vec<crate::record::ResolverRecord>> {
+) -> Result<()> {
 	let purge_ratio = crate::transport::DEFAULT_SLOW_PURGE_RATIO;
 	let finalist_min = crate::transport::DEFAULT_SLOW_FINALIST_MIN;
 	let total_rounds = config.rounds;
 
 	println!("Staged elimination: {} resolvers, {} total rounds, purge {:.0}% per stage",
-		resolvers.len(), total_rounds, purge_ratio * 100.0);
+		records.len(), total_rounds, purge_ratio * 100.0);
 
-	let mut active_resolvers = resolvers.to_vec();
 	let mut round_offset = 0u32;
 
 	while round_offset < total_rounds {
-		// Run 2-round block (or remaining rounds if fewer left)
 		let block_rounds = 2.min(total_rounds - round_offset);
 
-		// Build a config for this block
 		let mut block_config = config.clone();
 		block_config.rounds = block_rounds;
 
 		println!("  Stage: {} resolvers, rounds {}-{}",
-			active_resolvers.len(),
+			records.len(),
 			round_offset + 1,
 			round_offset + block_rounds);
 
-		let results = run_benchmark(
-			&active_resolvers, categories, &block_config, doh_clients,
-		).await?;
+		// Run benchmark on current records (writes BenchmarkResult in place)
+		run_benchmark(records, categories, &block_config, doh_clients).await?;
 
 		round_offset += block_rounds;
 
 		// Check if we should purge
-		let target_count = (active_resolvers.len() as f64 * (1.0 - purge_ratio)) as usize;
-		if round_offset < total_rounds && active_resolvers.len() > finalist_min && target_count >= finalist_min {
-			// Keep the top half by score
+		let target_count = (records.len() as f64 * (1.0 - purge_ratio)) as usize;
+		if round_offset < total_rounds && records.len() > finalist_min && target_count >= finalist_min {
+			// Records are already ranked by run_benchmark; keep top N
 			let keep_count = target_count.max(finalist_min);
-			let keep_ips: std::collections::HashSet<String> = results.iter()
-				.take(keep_count)
-				.map(|r| r.resolver.addr.ip().to_string())
-				.collect();
-
-			let before = active_resolvers.len();
-			active_resolvers.retain(|r| keep_ips.contains(&r.addr.ip().to_string()));
+			let before = records.len();
+			records.truncate(keep_count);
 			println!("  Purged: {} -> {} resolvers (removed weaker half)",
-				before, active_resolvers.len());
+				before, records.len());
+			// Clear benchmark results for next round (will be recomputed)
+			for rec in records.iter_mut() {
+				rec.benchmark = None;
+			}
 		} else if round_offset >= total_rounds {
-			// Final block — return these results
-			return Ok(results);
+			return Ok(());
 		}
 	}
 
-	// Final benchmark on remaining resolvers
+	// Final benchmark on remaining records
 	let mut final_config = config.clone();
 	final_config.rounds = 2.min(total_rounds.saturating_sub(round_offset));
 	if final_config.rounds > 0 {
-		let results = run_benchmark(
-			&active_resolvers, categories, &final_config, doh_clients,
-		).await?;
-		return Ok(results);
+		run_benchmark(records, categories, &final_config, doh_clients).await?;
 	}
 
-	// Shouldn't reach here, but run a final pass just in case
-	run_benchmark(&active_resolvers, categories, config, doh_clients).await
+	Ok(())
 }
 
 /// Run the full benchmark across all resolvers and domains.
@@ -1203,11 +1166,11 @@ pub async fn run_staged_benchmark(
 /// Returns scored and ranked resolver results.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_benchmark(
-	resolvers: &[Resolver],
+	records: &mut [crate::record::ResolverRecord],
 	categories: &std::collections::BTreeMap<String, Vec<String>>,
 	config: &BenchmarkConfig,
 	doh_clients: &DohClientPool,
-) -> Result<Vec<crate::record::ResolverRecord>> {
+) -> Result<()> {
 	// Determine which query types to use
 	let query_types = if config.query_aaaa {
 		vec![QueryType::A, QueryType::AAAA]
@@ -1217,7 +1180,8 @@ pub async fn run_benchmark(
 
 	// Build the list of all query tasks from all categories
 	let mut tasks: Vec<QueryTask> = Vec::new();
-	for resolver in resolvers {
+	for rec in records.iter() {
+		let resolver = &rec.resolver;
 		for (category_name, domains) in categories {
 			for domain in domains {
 				for &qt in &query_types {
@@ -1234,7 +1198,7 @@ pub async fn run_benchmark(
 
 	let total_queries = tasks.len() * config.rounds as usize;
 	println!("  {} queries across {} resolvers, {} rounds",
-		total_queries, resolvers.len(), config.rounds);
+		total_queries, records.len(), config.rounds);
 
 	// Collect all results across rounds
 	let mut all_results: Vec<(QueryTask, QueryResult)> = Vec::new();
@@ -1249,8 +1213,8 @@ pub async fn run_benchmark(
 	// Track sidelined resolvers (by IP string)
 	let mut sidelined: std::collections::HashSet<String> = std::collections::HashSet::new();
 	// Build config map for sidelining messages and metadata lookups
-	let sideline_config_map: HashMap<String, &Resolver> = resolvers.iter()
-		.map(|r| (r.addr.ip().to_string(), r))
+	let sideline_config_map: HashMap<String, &Resolver> = records.iter()
+		.map(|r| (r.resolver.addr.ip().to_string(), &r.resolver))
 		.collect();
 
 	for round in 0..config.rounds {
@@ -1452,17 +1416,21 @@ pub async fn run_benchmark(
 		}
 	}
 
-	// Map resolver IP back to full config for metadata lookups
-	let config_map: HashMap<String, &Resolver> = resolvers.iter()
-		.map(|r| (r.addr.ip().to_string(), r))
+	// Write BenchmarkResult onto each existing record
+	// Build IP-to-record-index map
+	let ip_to_idx: HashMap<String, usize> = records.iter().enumerate()
+		.map(|(i, r)| (r.resolver.addr.ip().to_string(), i))
 		.collect();
 
-	// Build ResolverRecord for each resolver with benchmark results
-	let mut records: Vec<crate::record::ResolverRecord> = Vec::new();
-	// Track all latencies per resolver for uncertainty computation
-	let mut all_latencies_per_resolver: Vec<Vec<f64>> = Vec::new();
+	// Track all latencies per record for uncertainty computation
+	let mut all_latencies: Vec<Vec<f64>> = vec![Vec::new(); records.len()];
 
 	for (resolver_ip, agg) in &resolver_data {
+		let idx = match ip_to_idx.get(resolver_ip) {
+			Some(&i) => i,
+			None => continue,
+		};
+
 		// Compute per-category stats
 		let mut cat_stats: std::collections::BTreeMap<String, crate::stats::SetStats> = std::collections::BTreeMap::new();
 		for (cat_name, cat_agg) in &agg.categories {
@@ -1493,61 +1461,39 @@ pub async fn run_benchmark(
 			0.0
 		};
 
-		// Look up resolver config for identity
-		let resolver = config_map.get(resolver_ip)
-			.map(|r| (*r).clone())
-			.unwrap_or_else(|| {
-				// Fallback: build minimal resolver from IP string
-				{
-					let mut r = Resolver::new(
-						format!("{}:53", resolver_ip).parse().unwrap(),
-						DnsTransport::Udp,
-					);
-					r.label = resolver_ip.clone();
-					r
-				}
-			});
-
 		// Combine all latencies for uncertainty computation
-		let mut combined: Vec<f64> = Vec::new();
 		for cat_agg in agg.categories.values() {
-			combined.extend(&cat_agg.latencies);
+			all_latencies[idx].extend(&cat_agg.latencies);
 		}
-		all_latencies_per_resolver.push(combined);
 
-		let mut record = crate::record::ResolverRecord::new(resolver);
-		record.benchmark = Some(crate::record::BenchmarkResult {
+		// Write benchmark result onto existing record (preserves characterization etc.)
+		records[idx].benchmark = Some(crate::record::BenchmarkResult {
 			categories: cat_stats,
 			overall_score,
 			success_rate,
 			rank: 0,
 			tie_group: None,
 		});
-		records.push(record);
 	}
 
 	// Rank records by sort mode
-	rank_records(&mut records, &config.sort_mode);
+	rank_records(records, &config.sort_mode);
 
-	// Build label-to-uncertainty map for O(1) lookup
-	let uncertainty_map: HashMap<String, f64> = resolver_data.iter()
-		.enumerate()
-		.map(|(i, (ip, _))| {
-			let label = config_map.get(ip).map(|r| r.label.clone())
-				.unwrap_or_else(|| ip.clone());
-			(label, compute_uncertainty(&all_latencies_per_resolver[i]))
+	// Build uncertainty map for tie detection
+	let uncertainty_map: HashMap<String, f64> = records.iter().enumerate()
+		.map(|(i, rec)| {
+			(rec.resolver.label.clone(), compute_uncertainty(&all_latencies[i]))
 		})
 		.collect();
 
-	// Look up uncertainties in ranked order for tie detection
 	let uncertainties: Vec<f64> = records.iter()
 		.map(|rec| {
 			uncertainty_map.get(&rec.resolver.label).copied().unwrap_or(0.0)
 		})
 		.collect();
-	detect_ties_on_records(&mut records, &uncertainties);
+	detect_ties_on_records(records, &uncertainties);
 
-	Ok(records)
+	Ok(())
 }
 
 /// Per-category aggregation of query results

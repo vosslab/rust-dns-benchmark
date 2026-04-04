@@ -206,7 +206,7 @@ pub fn detect_ties_on_records(records: &mut [crate::record::ResolverRecord], unc
 
 /// Rank resolver records by the chosen sort mode, ascending.
 /// Sets benchmark.rank on each record. Lower scores/latencies are better.
-pub fn rank_records(records: &mut Vec<crate::record::ResolverRecord>, sort_mode: &SortMode) {
+pub fn rank_records(records: &mut [crate::record::ResolverRecord], sort_mode: &SortMode) {
 	let cmp_f64 = |a: f64, b: f64| -> std::cmp::Ordering {
 		a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
 	};

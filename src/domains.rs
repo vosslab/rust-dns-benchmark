@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use anyhow::{anyhow, Result};
 
 /// Default query domains CSV, embedded at compile time.
 const DEFAULT_QUERY_DOMAINS_CSV: &str = include_str!("../query_domains.csv");

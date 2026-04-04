@@ -110,7 +110,7 @@ impl std::fmt::Display for Resolver {
 //============================================
 /// Classify a resolver IP as "system", "private" (RFC1918), or "public".
 /// Used to compute the cached `Resolver.class` field at construction time.
-pub fn resolver_class(resolver: &Resolver) -> &'static str {
+pub(crate) fn resolver_class(resolver: &Resolver) -> &'static str {
 	if resolver.is_system {
 		return "system";
 	}

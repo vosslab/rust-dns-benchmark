@@ -7,64 +7,10 @@ use tokio::sync::Semaphore;
 
 use crate::bench::{spawn_progress_monitor, stop_progress_monitor};
 use crate::record::ResolverRecord;
-use crate::transport::Resolver;
 
-/// Perform reverse DNS (PTR) lookups for all resolver IPs.
-///
-/// Uses the system resolver to look up PTR records for each resolver's IP
-/// address. Results are stored in each Resolver's ptr_name field.
-pub async fn resolve_ptr_names(
-	resolvers: &mut [Resolver],
-	timeout: Duration,
-) {
-	println!("Resolving PTR records ({} resolvers)...", resolvers.len());
-
-	let total = resolvers.len();
-	let completed = Arc::new(AtomicUsize::new(0));
-	let start = Instant::now();
-	let monitor = spawn_progress_monitor(
-		"PTR lookup".to_string(), completed.clone(), total, start,
-	);
-
-	let semaphore = std::sync::Arc::new(Semaphore::new(16));
-	let mut handles = Vec::new();
-
-	for (i, resolver) in resolvers.iter().enumerate() {
-		let ip = resolver.addr.ip();
-		let sem = semaphore.clone();
-		let tm = timeout;
-		let done = completed.clone();
-
-		handles.push(tokio::spawn(async move {
-			let _permit = sem.acquire().await.unwrap();
-			let ptr_name = lookup_ptr(ip, tm).await;
-			done.fetch_add(1, Ordering::Relaxed);
-			(i, ptr_name)
-		}));
-	}
-
-	let mut resolved_count = 0usize;
-	for handle in handles {
-		match handle.await {
-			Ok((idx, ptr_name)) => {
-				if ptr_name.is_some() { resolved_count += 1; }
-				resolvers[idx].ptr_name = ptr_name;
-			}
-			Err(e) => {
-				eprintln!("Warning: PTR lookup task failed: {}", e);
-			}
-		}
-	}
-	stop_progress_monitor(monitor, "PTR lookup", total, start);
-	println!("  {} resolved, {} no PTR record", resolved_count, total - resolved_count);
-
-	println!();
-}
-
-//============================================
 /// Perform reverse DNS (PTR) lookups for all resolver records.
 /// Updates each record's resolver.ptr_name field.
-pub async fn resolve_ptr_records(
+pub async fn resolve_ptr_names(
 	records: &mut [ResolverRecord],
 	timeout: Duration,
 ) {

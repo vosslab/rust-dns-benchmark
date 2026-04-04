@@ -20,6 +20,14 @@
 - Moved `intercepts_nxdomain`, `rebinding_protection`, `validates_dnssec` off `Resolver` into `CharacterizationResult` permanently
 - Added `declared_dnssec` field on `Resolver` for CSV-provided DNSSEC metadata (separate from run-observed characterization)
 - Added `Resolver::new(addr, transport)` constructor; simplified all resolver construction sites to use it instead of verbose struct literals
+- Completed end-to-end pipeline migration: all stages (`run_discovery`, `run_characterization`, `run_qualification`, `run_benchmark`, `run_staged_benchmark`, `resolve_ptr_names`) now take `&mut [ResolverRecord]` and write stage results directly onto existing records
+- Records created once at pipeline start in main.rs; no stage creates, clones, or reconstructs records
+- `run_qualification` now writes real computed `QualificationResult` values (score, p50, stddev, timeout_rate) instead of placeholder zeroes
+- `run_discovery` now writes `DiscoveryResult` with pass/fail, latency, and reason on each record
+- Deleted transitional code: `run_qualification_records` wrapper, `char_map` merge-back, `bench_resolvers` extraction, old `resolve_ptr_names(&mut [Resolver])`, fresh `ResolverRecord::new()` in benchmark
+- Renamed `resolve_ptr_records` back to `resolve_ptr_names` (no ambiguity)
+- Changed `resolver_class()` to `pub(crate)` visibility
+- Removed unused `anyhow` import from `src/domains.rs`
 
 ### Additions and New Features
 - Characterization reachability now collects up to 3 successful latencies and reports median instead of first-success latency, producing more stable and less optimistic latency estimates
