@@ -30,12 +30,15 @@ pub struct CharacterizationResult {
 }
 
 /// Result of the qualification scoring stage for a single resolver.
+///
+/// Score formula matches the benchmark family:
+///   score = p50 + 0.5 * (p95 - p50) + timeout_penalty * timeout_rate
 #[derive(Debug, Clone)]
 pub struct QualificationResult {
 	pub score: f64,
 	pub promoted: bool,
 	pub p50_ms: f64,
-	pub stddev_ms: f64,
+	pub p95_ms: f64,
 	pub timeout_rate: f64,
 }
 

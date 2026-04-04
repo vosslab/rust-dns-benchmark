@@ -2,6 +2,13 @@
 
 ## 2026-04-03
 
+### Behavior or Interface Changes
+- Aligned qualification scoring formula with benchmark: now uses `p50 + 0.5*(p95-p50) + timeout_penalty*timeout_rate` instead of `median + stddev + timeout_penalty`; gives one consistent scoring family across both pipeline phases
+- Changed "Fastest resolver" summary line to "Best benchmark score" and now finds the true lowest-scoring resolver instead of assuming `results[0]` is best (was wrong after system pinning)
+- System resolvers pinned to the top now show "ranked #N in displayed results due to pinning" instead of implying they won on score
+- Added footnote after results table: "system resolvers are pinned to the top of the displayed list and may not have the lowest benchmark score"
+- `QualificationResult` now stores `p95_ms` instead of `stddev_ms` to match the new formula inputs
+
 ### Fixes and Maintenance
 - Consolidated 8 parallel HashMaps in `src/bench.rs` (label, intercept, system, transport, PTR, rebinding, DNSSEC, plus sidelining and qualification maps) into single `config_map: HashMap<String, &Resolver>` lookups; no behavioral change
 - Renamed `ResolverConfig` to `Resolver` across the codebase; IP address is the true key, labels are display metadata

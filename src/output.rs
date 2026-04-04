@@ -269,6 +269,13 @@ pub fn print_results_table(results: &[ResolverRecord]) {
 	if has_ties {
 		println!("\nNote: resolvers with shared rank (e.g. 1-3) are statistically tied.");
 	}
+
+	// Footnote when system resolvers are pinned to the top
+	let has_pinned = results.iter().any(|r| r.resolver.is_system);
+	if has_pinned {
+		println!("\nNote: system resolvers are pinned to the top of the displayed list");
+		println!("and may not have the lowest benchmark score.");
+	}
 }
 
 /// Print a summary of how many resolvers survived each pipeline stage.
@@ -328,10 +335,17 @@ pub fn print_conclusions(results: &[ResolverRecord]) {
 	println!("\nConclusions");
 	println!("===========\n");
 
-	// Find the best resolver overall
-	let best = &results[0];
+	// Find the resolver with the true lowest benchmark score
+	let best = results.iter()
+		.filter_map(|r| r.benchmark.as_ref().map(|bm| (r, bm.overall_score)))
+		.min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+		.map(|(r, _)| r);
+	let best = match best {
+		Some(r) => r,
+		None => return,
+	};
 	let best_score = best.benchmark.as_ref().map(|b| b.overall_score).unwrap_or(f64::INFINITY);
-	println!("Fastest resolver: {} (score {:.1})", best.resolver.label, best_score);
+	println!("Best benchmark score: {} (score {:.1})", best.resolver.label, best_score);
 
 	// Report on system resolvers
 	let total = results.len();
@@ -343,12 +357,20 @@ pub fn print_conclusions(results: &[ResolverRecord]) {
 			Some(bm) => bm,
 			None => continue,
 		};
-		println!(
-			"Your system resolver {} ranked #{} out of {} tested.",
-			r.resolver.label, bm.rank, total,
-		);
+		// Note pinning if system resolver is displayed at a different rank than its score warrants
+		if r.resolver.label != best.resolver.label {
+			println!(
+				"System resolver: {} ranked #{} in displayed results due to pinning.",
+				r.resolver.label, bm.rank,
+			);
+		} else {
+			println!(
+				"Your system resolver {} ranked #{} out of {} tested.",
+				r.resolver.label, bm.rank, total,
+			);
+		}
 		// Compare to best
-		if bm.rank > 1 && best_score > 0.0 {
+		if bm.overall_score > best_score && best_score > 0.0 {
 			let pct_slower = ((bm.overall_score - best_score) / best_score) * 100.0;
 			if pct_slower > 20.0 {
 				println!(

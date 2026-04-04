@@ -195,13 +195,13 @@ impl TelemetryLog {
 	//============================================
 	/// Log a qualification score for a single resolver.
 	pub fn log_qualification(&self, resolver: &str, label: &str, class: &str,
-		score: f64, promoted: bool, p50_ms: f64, stddev_ms: f64, timeout_rate: f64,
+		score: f64, promoted: bool, p50_ms: f64, p95_ms: f64, timeout_rate: f64,
 	) {
 		let ts = timestamp_iso();
 		let line = format!(
-			r#"{{"event":"qualification","timestamp":"{}","resolver":"{}","label":"{}","class":"{}","score":{:.1},"promoted":{},"p50_ms":{:.1},"stddev_ms":{:.1},"timeout_rate":{:.3}}}"#,
+			r#"{{"event":"qualification","timestamp":"{}","resolver":"{}","label":"{}","class":"{}","score":{:.1},"promoted":{},"p50_ms":{:.1},"p95_ms":{:.1},"timeout_rate":{:.3}}}"#,
 			ts, json_escape(resolver), json_escape(label), json_escape(class),
-			score, promoted, p50_ms, stddev_ms, timeout_rate
+			score, promoted, p50_ms, p95_ms, timeout_rate
 		);
 		self.write_line(&line);
 	}

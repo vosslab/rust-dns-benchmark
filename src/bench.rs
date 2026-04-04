@@ -1018,7 +1018,8 @@ pub async fn run_qualification(
 	stop_progress_monitor(monitor, "Qualifying", qual_total, qual_start);
 
 	// Score each resolver: lower is better
-	// Score = median_latency + variance_penalty + timeout_penalty
+	// Score = p50 + 0.5*(p95-p50) + timeout_penalty*timeout_rate
+	// Same formula family as the benchmark phase for consistency
 	let timeout_penalty_ms = config.timeout.as_millis() as f64;
 	let mut scored: Vec<(std::net::IpAddr, f64, f64, f64, f64)> = resolver_data.iter()
 		.map(|(ip, (latencies, total, timeouts))| {
@@ -1028,12 +1029,11 @@ pub async fn run_qualification(
 			}
 			let mut sorted = latencies.clone();
 			sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-			let median = sorted[sorted.len() / 2];
-			let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
-			let variance = sorted.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / sorted.len() as f64;
-			let stddev = variance.sqrt();
-			let score = median + stddev + (timeout_rate * timeout_penalty_ms);
-			(*ip, score, median, stddev, timeout_rate)
+			// Use percentile helper; fall back to simple index for tiny samples
+			let p50 = crate::stats::percentile(&sorted, 50.0).unwrap_or(sorted[sorted.len() / 2]);
+			let p95 = crate::stats::percentile(&sorted, 95.0).unwrap_or(sorted[sorted.len() - 1]);
+			let score = p50 + 0.5 * (p95 - p50) + (timeout_rate * timeout_penalty_ms);
+			(*ip, score, p50, p95, timeout_rate)
 		})
 		.collect();
 
@@ -1050,21 +1050,21 @@ pub async fn run_qualification(
 	// Build score lookup by IP for writing onto records
 	let score_map: HashMap<std::net::IpAddr, (f64, f64, f64, f64, bool)> = scored.iter()
 		.enumerate()
-		.map(|(i, (ip, score, p50, stddev, timeout_rate))| {
+		.map(|(i, (ip, score, p50, p95, timeout_rate))| {
 			let promoted = score.is_finite() && i < promote_count;
-			(*ip, (*score, *p50, *stddev, *timeout_rate, promoted))
+			(*ip, (*score, *p50, *p95, *timeout_rate, promoted))
 		})
 		.collect();
 
 	// Log all candidates and write QualificationResult onto each record
 	let total_candidates = records.len();
-	for (i, (ip, score, p50, stddev, timeout_rate)) in scored.iter().enumerate() {
+	for (i, (ip, score, p50, p95, timeout_rate)) in scored.iter().enumerate() {
 		let promoted = score.is_finite() && i < promote_count;
 		// Find the record for telemetry logging
 		if let Some(rec) = records.iter().find(|r| r.resolver.addr.ip() == *ip) {
 			config.telemetry.log_qualification(
 				&ip.to_string(), &rec.resolver.label, rec.resolver.class,
-				*score, promoted, *p50, *stddev, *timeout_rate,
+				*score, promoted, *p50, *p95, *timeout_rate,
 			);
 			if rec.resolver.class != "public" {
 				let status = if promoted { "promoted" } else { "not promoted" };
@@ -1078,12 +1078,12 @@ pub async fn run_qualification(
 	// Write QualificationResult on each record
 	for rec in records.iter_mut() {
 		let ip = rec.resolver.addr.ip();
-		if let Some((score, p50, stddev, timeout_rate, promoted)) = score_map.get(&ip) {
+		if let Some((score, p50, p95, timeout_rate, promoted)) = score_map.get(&ip) {
 			rec.qualification = Some(crate::record::QualificationResult {
 				score: *score,
 				promoted: *promoted,
 				p50_ms: *p50,
-				stddev_ms: *stddev,
+				p95_ms: *p95,
 				timeout_rate: *timeout_rate,
 			});
 		}
