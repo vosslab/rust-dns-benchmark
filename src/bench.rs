@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -68,7 +69,7 @@ fn round_eta_up(secs: f64) -> u64 {
 		30
 	};
 	// Round up to next multiple of bucket
-	((s + bucket - 1) / bucket) * bucket
+	s.div_ceil(bucket) * bucket
 }
 
 /// Spawn a progress monitor that prints live progress with EMA-smoothed ETA.
@@ -135,7 +136,7 @@ pub fn stop_progress_monitor(
 	let time_str = format_duration_secs(elapsed_secs);
 	// Clear entire line first to avoid leftover characters from longer progress text
 	eprint!("\r{:width$}\r", "", width = 80);
-	eprint!("  {}: {}/{} (100%) -- done in {}\n", label, total, total, time_str);
+	eprintln!("  {}: {}/{} (100%) -- done in {}", label, total, total, time_str);
 }
 
 /// Send a single DNS query over UDP and measure latency.
@@ -163,9 +164,6 @@ async fn send_udp_query(
 		Err(_) => {
 			return QueryResult {
 				resolver: resolver_label,
-				domain: domain.to_string(),
-				query_type,
-				rcode: None,
 				latency: timeout,
 				success: false,
 				timeout: true,
@@ -178,9 +176,6 @@ async fn send_udp_query(
 	if socket.send_to(query_bytes, resolver).await.is_err() {
 		return QueryResult {
 			resolver: resolver_label,
-			domain: domain.to_string(),
-			query_type,
-			rcode: None,
 			latency: timeout,
 			success: false,
 			timeout: true,
@@ -207,9 +202,6 @@ async fn send_udp_query(
 							response.rcode == ResponseCode::NoError;
 						return QueryResult {
 							resolver: resolver_label,
-							domain: domain.to_string(),
-							query_type,
-							rcode: Some(response.rcode_str),
 							latency,
 							success,
 							timeout: false,
@@ -231,9 +223,6 @@ async fn send_udp_query(
 	// Exhausted retries or timed out
 	QueryResult {
 		resolver: resolver_label,
-		domain: domain.to_string(),
-		query_type,
-		rcode: None,
 		latency: start.elapsed(),
 		success: false,
 		timeout: true,
@@ -257,9 +246,6 @@ async fn send_dot_query(
 	let resolver_label = resolver.ip().to_string();
 	let make_timeout_result = || QueryResult {
 		resolver: resolver_label.clone(),
-		domain: domain.to_string(),
-		query_type,
-		rcode: None,
 		latency: timeout,
 		success: false,
 		timeout: true,
@@ -345,9 +331,6 @@ async fn send_dot_query(
 			let success = response.rcode == ResponseCode::NoError;
 			QueryResult {
 				resolver: resolver_label,
-				domain: domain.to_string(),
-				query_type,
-				rcode: Some(response.rcode_str),
 				latency,
 				success,
 				timeout: false,
@@ -371,9 +354,6 @@ async fn send_doh_query(
 ) -> QueryResult {
 	let make_timeout_result = || QueryResult {
 		resolver: url.to_string(),
-		domain: domain.to_string(),
-		query_type,
-		rcode: None,
 		latency: timeout,
 		success: false,
 		timeout: true,
@@ -411,9 +391,6 @@ async fn send_doh_query(
 			let success = response.rcode == ResponseCode::NoError;
 			QueryResult {
 				resolver: url.to_string(),
-				domain: domain.to_string(),
-				query_type,
-				rcode: Some(response.rcode_str),
 				latency,
 				success,
 				timeout: false,
@@ -427,9 +404,6 @@ async fn send_doh_query(
 					let success = response.rcode == ResponseCode::NoError;
 					return QueryResult {
 						resolver: url.to_string(),
-						domain: domain.to_string(),
-						query_type,
-						rcode: Some(response.rcode_str),
 						latency,
 						success,
 						timeout: false,
@@ -441,9 +415,11 @@ async fn send_doh_query(
 	}
 }
 
-/// Dispatch a query to the appropriate transport based on resolver config.
+/// Dispatch a query to the appropriate transport based on resolver address and transport.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_query(
-	resolver: &Resolver,
+	addr: SocketAddr,
+	transport: &DnsTransport,
 	query_bytes: &[u8],
 	timeout: Duration,
 	txid: u16,
@@ -451,13 +427,13 @@ async fn dispatch_query(
 	query_type: QueryType,
 	doh_clients: &DohClientPool,
 ) -> QueryResult {
-	match &resolver.transport {
+	match transport {
 		DnsTransport::Udp => {
-			send_udp_query(resolver.addr, query_bytes, timeout, txid, domain, query_type).await
+			send_udp_query(addr, query_bytes, timeout, txid, domain, query_type).await
 		}
 		DnsTransport::Dot { hostname } => {
 			send_dot_query(
-				resolver.addr, hostname, query_bytes, timeout,
+				addr, hostname, query_bytes, timeout,
 				txid, domain, query_type,
 			).await
 		}
@@ -485,10 +461,13 @@ pub fn build_doh_client_pool(resolvers: &[Resolver]) -> DohClientPool {
 	pool
 }
 
-/// A single query task: resolver + domain + query type + set membership
+/// A single query task: resolver identity + domain + query type + set membership.
+/// Holds only SocketAddr and DnsTransport instead of full Resolver to avoid
+/// cloning label, ptr_name, and other metadata on every query task.
 #[derive(Clone, Debug)]
 struct QueryTask {
-	resolver: Resolver,
+	resolver_addr: SocketAddr,
+	resolver_transport: DnsTransport,
 	domain: String,
 	query_type: QueryType,
 	set_name: String,
@@ -831,7 +810,9 @@ pub async fn run_discovery(
 		let sem = semaphore.clone();
 		let dnssec = false;
 		let domain = screen_domain.to_string();
-		let resolver_clone = rec.resolver.clone();
+		// Clone only the fields needed for dispatch and result reporting
+		let addr = rec.resolver.addr;
+		let transport = rec.resolver.transport.clone();
 		let doh_clients = doh_clients.clone();
 		let done = screen_done.clone();
 		let screen_timeout = match &rec.resolver.transport {
@@ -848,16 +829,16 @@ pub async fn run_discovery(
 				Ok(b) => b,
 				Err(_) => {
 					done.fetch_add(1, Ordering::Relaxed);
-					return (i, resolver_clone, false, true, 0.0);
+					return (i, false, true, 0.0);
 				}
 			};
 			let result = dispatch_query(
-				&resolver_clone, &query_bytes, screen_timeout,
+				addr, &transport, &query_bytes, screen_timeout,
 				txid, &domain, QueryType::A, &doh_clients,
 			).await;
 			let latency_ms = result.latency.as_secs_f64() * 1000.0;
 			done.fetch_add(1, Ordering::Relaxed);
-			(i, resolver_clone, result.success, result.timeout, latency_ms)
+			(i, result.success, result.timeout, latency_ms)
 		}));
 	}
 
@@ -868,12 +849,14 @@ pub async fn run_discovery(
 	let mut failed_fast = 0usize;
 	for handle in screen_handles {
 		match handle.await {
-			Ok((idx, resolver, reachable, was_timeout, latency_ms)) => {
-				let class = resolver.class;
+			Ok((idx, reachable, was_timeout, latency_ms)) => {
+				// Read resolver metadata from the original record (not cloned)
+				let class = records[idx].resolver.class;
+				let ip_str = records[idx].resolver.addr.ip().to_string();
+				let label = &records[idx].resolver.label;
 				if reachable {
 					config.telemetry.log_discovery(
-						&resolver.addr.ip().to_string(), &resolver.label,
-						class, true, "reachable", latency_ms,
+						&ip_str, label, class, true, "reachable", latency_ms,
 					);
 					records[idx].discovery = Some(crate::record::DiscoveryResult {
 						passed: true,
@@ -884,8 +867,7 @@ pub async fn run_discovery(
 				} else {
 					let reason = if was_timeout { "timeout" } else { "connect_failed" };
 					config.telemetry.log_discovery(
-						&resolver.addr.ip().to_string(), &resolver.label,
-						class, false, reason, latency_ms,
+						&ip_str, label, class, false, reason, latency_ms,
 					);
 					records[idx].discovery = Some(crate::record::DiscoveryResult {
 						passed: false,
@@ -895,7 +877,7 @@ pub async fn run_discovery(
 					// Print private/system resolver failures to stdout
 					if class != "public" {
 						println!("  {} {} ({}) -- {}",
-							class, resolver.label, resolver.addr.ip(), reason);
+							class, label, ip_str, reason);
 					}
 					if was_timeout { timed_out += 1; } else { failed_fast += 1; }
 				}
@@ -963,12 +945,13 @@ pub async fn run_qualification(
 		"Qualifying".to_string(), qual_done.clone(), qual_total, qual_start,
 	);
 
-	// Run qualification queries -- clone resolver for each async task
+	// Run qualification queries -- clone only addr + transport for each async task
 	let mut handles = Vec::new();
 	for rec in records.iter() {
 		for domain in &qual_domains {
 			let sem = semaphore.clone();
-			let resolver_clone = rec.resolver.clone();
+			let addr = rec.resolver.addr;
+			let transport = rec.resolver.transport.clone();
 			let dnssec = config.dnssec;
 			let domain_clone = domain.clone();
 			let doh_clients = doh_clients.clone();
@@ -983,19 +966,19 @@ pub async fn run_qualification(
 					Ok(b) => b,
 					Err(_) => {
 						done.fetch_add(1, Ordering::Relaxed);
-						return (resolver_clone.addr.ip(), None, true);
+						return (addr.ip(), None, true);
 					}
 				};
 				let result = dispatch_query(
-					&resolver_clone, &query_bytes, timeout,
+					addr, &transport, &query_bytes, timeout,
 					txid, &domain_clone, QueryType::A, &doh_clients,
 				).await;
 				done.fetch_add(1, Ordering::Relaxed);
 				if result.success {
 					let latency_ms = result.latency.as_secs_f64() * 1000.0;
-					(resolver_clone.addr.ip(), Some(latency_ms), false)
+					(addr.ip(), Some(latency_ms), false)
 				} else {
-					(resolver_clone.addr.ip(), None, result.timeout)
+					(addr.ip(), None, result.timeout)
 				}
 			}));
 		}
@@ -1090,7 +1073,7 @@ pub async fn run_qualification(
 	}
 
 	let promoted_count = records.iter()
-		.filter(|r| r.qualification.as_ref().map_or(false, |q| q.promoted))
+		.filter(|r| r.qualification.as_ref().is_some_and(|q| q.promoted))
 		.count();
 	println!("  Promoted {} finalists from {} candidates (budget {})",
 		promoted_count, total_candidates, budget);
@@ -1186,7 +1169,8 @@ pub async fn run_benchmark(
 			for domain in domains {
 				for &qt in &query_types {
 					tasks.push(QueryTask {
-						resolver: resolver.clone(),
+						resolver_addr: resolver.addr,
+						resolver_transport: resolver.transport.clone(),
 						domain: domain.clone(),
 						query_type: qt,
 						set_name: category_name.clone(),
@@ -1222,7 +1206,7 @@ pub async fn run_benchmark(
 		// Filter out sidelined resolvers for this round
 		let mut round_tasks = tasks.clone();
 		if !sidelined.is_empty() {
-			round_tasks.retain(|t| !sidelined.contains(&t.resolver.addr.ip().to_string()));
+			round_tasks.retain(|t| !sidelined.contains(&t.resolver_addr.ip().to_string()));
 		}
 		round_tasks.shuffle(&mut rng);
 
@@ -1265,10 +1249,7 @@ pub async fn run_benchmark(
 					Ok(bytes) => bytes,
 					Err(_) => {
 						return (task.clone(), QueryResult {
-							resolver: task.resolver.addr.ip().to_string(),
-							domain: task.domain.clone(),
-							query_type: task.query_type,
-							rcode: None,
+							resolver: task.resolver_addr.ip().to_string(),
 							latency: Duration::ZERO,
 							success: false,
 							timeout: false,
@@ -1278,7 +1259,7 @@ pub async fn run_benchmark(
 
 				// Send query via appropriate transport
 				let result = dispatch_query(
-					&task.resolver, &query_bytes,
+					task.resolver_addr, &task.resolver_transport, &query_bytes,
 					timeout, txid, &task.domain, task.query_type,
 					&doh_clients,
 				).await;
@@ -1308,7 +1289,7 @@ pub async fn run_benchmark(
 		// Log round completion to telemetry
 		let round_failures = all_results.iter()
 			.filter(|(t, r)| {
-				let ip = t.resolver.addr.ip().to_string();
+				let ip = t.resolver_addr.ip().to_string();
 				!sidelined.contains(&ip) && !r.success
 			})
 			.count();
@@ -1318,7 +1299,7 @@ pub async fn run_benchmark(
 		{
 			let mut round_stats: HashMap<String, (usize, usize, usize, Vec<f64>)> = HashMap::new();
 			for (task, result) in &all_results {
-				let ip = task.resolver.addr.ip().to_string();
+				let ip = task.resolver_addr.ip().to_string();
 				if sidelined.contains(&ip) { continue; }
 				// Only count results from the current round
 				let entry = round_stats.entry(ip).or_insert((0, 0, 0, Vec::new()));
@@ -1351,7 +1332,7 @@ pub async fn run_benchmark(
 		if round < config.rounds - 1 {
 			let mut per_resolver: HashMap<String, (usize, usize, Vec<f64>)> = HashMap::new();
 			for (task, result) in &all_results {
-				let ip = task.resolver.addr.ip().to_string();
+				let ip = task.resolver_addr.ip().to_string();
 				if sidelined.contains(&ip) {
 					continue;
 				}

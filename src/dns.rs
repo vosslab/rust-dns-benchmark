@@ -11,9 +11,6 @@ use crate::transport::QueryType;
 #[derive(Debug)]
 pub struct DnsResponse {
 	pub rcode: ResponseCode,
-	pub rcode_str: String,
-	#[allow(dead_code)]
-	pub answer_count: usize,
 	/// True if the answer section contains A records
 	pub has_a_records: bool,
 }
@@ -79,17 +76,12 @@ pub fn parse_response(
 	}
 
 	let rcode = message.response_code();
-	let rcode_str = format!("{}", rcode);
-	let answer_count = message.answer_count() as usize;
-
 	// Check if any answer records are A records
 	let has_a_records = message.answers().iter()
 		.any(|r| r.record_type() == RecordType::A);
 
 	Ok(DnsResponse {
 		rcode,
-		rcode_str,
-		answer_count,
 		has_a_records,
 	})
 }

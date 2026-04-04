@@ -200,7 +200,7 @@ async fn run() -> anyhow::Result<()> {
 		.collect();
 
 	// Track phase timings for summary
-	let mut phase_timings: Vec<(&str, std::time::Duration, Option<(usize, usize)>)> = Vec::new();
+	let mut phase_timings: Vec<output::PhaseTimingEntry> = Vec::new();
 	let pipeline_start = std::time::Instant::now();
 
 	// Discovery: reachability screen for large resolver lists
@@ -211,7 +211,7 @@ async fn run() -> anyhow::Result<()> {
 			&mut records, &categories, &config, &doh_clients,
 		).await;
 		// Retain only records that passed discovery (missing result = failure)
-		records.retain(|r| r.discovery.as_ref().map_or(false, |d| d.passed));
+		records.retain(|r| r.discovery.as_ref().is_some_and(|d| d.passed));
 		let discovery_elapsed = phase_start.elapsed();
 		config.telemetry.log_phase("discovery", discovery_elapsed.as_secs(), before, records.len());
 		phase_timings.push(("Discovery", discovery_elapsed, Some((before, records.len()))));
@@ -241,7 +241,7 @@ async fn run() -> anyhow::Result<()> {
 			&mut records, &categories, &config, &doh_clients,
 		).await;
 		// Retain only promoted records (missing qualification = not promoted)
-		records.retain(|r| r.qualification.as_ref().map_or(false, |q| q.promoted));
+		records.retain(|r| r.qualification.as_ref().is_some_and(|q| q.promoted));
 		phase_timings.push(("Qualification", qual_start.elapsed(), Some((qual_before, records.len()))));
 		config.telemetry.log_pipeline("after_qualification", records.len());
 	}

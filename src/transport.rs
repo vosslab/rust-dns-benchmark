@@ -147,12 +147,6 @@ pub enum QueryType {
 #[derive(Debug, Clone)]
 pub struct QueryResult {
 	pub resolver: String,
-	#[allow(dead_code)]
-	pub domain: String,
-	#[allow(dead_code)]
-	pub query_type: QueryType,
-	#[allow(dead_code)]
-	pub rcode: Option<String>,
 	pub latency: Duration,
 	pub success: bool,
 	pub timeout: bool,

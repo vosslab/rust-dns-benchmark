@@ -3,6 +3,20 @@
 ## 2026-04-03
 
 ### Behavior or Interface Changes
+- Extended CSV output with 10 new columns: `discovery_latency_ms`, `discovery_reason`, `char_reachable`, `char_attempts`, `char_successes`, `char_latency_ms`, `qual_score`, `qual_p50_ms`, `qual_p95_ms`, `qual_timeout_rate`; downstream consumers must tolerate new trailing columns
+
+### Fixes and Maintenance
+- Removed unused `BTreeMap` import from `src/stats.rs` (moved under `#[cfg(test)]`)
+- Removed dead fields from `QueryResult`: `domain`, `query_type`, `rcode` (written but never read)
+- Removed dead fields from `DnsResponse`: `answer_count`, `rcode_str` (written but never read)
+- Removed all `#[allow(dead_code)]` suppressions from `src/transport.rs` and `src/dns.rs`
+- Reduced Resolver cloning in async benchmark tasks: discovery and qualification now clone only `SocketAddr` + `DnsTransport` instead of full `Resolver`
+- Changed `QueryTask` to hold `resolver_addr: SocketAddr` + `resolver_transport: DnsTransport` instead of full `Resolver` clone
+- Changed `dispatch_query` signature from `&Resolver` to `SocketAddr` + `&DnsTransport`
+- Added `PhaseTimingEntry` type alias in `src/output.rs` to resolve clippy type_complexity warning
+- Fixed all pre-existing clippy warnings: `manual_div_ceil`, `print_with_newline`, `redundant_closure`, `unnecessary_map_or`, `manual_is_multiple_of`
+
+### Behavior or Interface Changes (scoring alignment)
 - Aligned qualification scoring formula with benchmark: now uses `p50 + 0.5*(p95-p50) + timeout_penalty*timeout_rate` instead of `median + stddev + timeout_penalty`; gives one consistent scoring family across both pipeline phases
 - Changed "Fastest resolver" summary line to "Best benchmark score" and now finds the true lowest-scoring resolver instead of assuming `results[0]` is best (was wrong after system pinning)
 - System resolvers pinned to the top now show "ranked #N in displayed results due to pinning" instead of implying they won on score

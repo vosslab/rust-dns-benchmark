@@ -66,7 +66,7 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 
 //============================================
 fn is_leap(y: u64) -> bool {
-	(y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+	(y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
 //============================================
@@ -178,6 +178,8 @@ impl TelemetryLog {
 
 	//============================================
 	/// Log a characterization result for a single resolver.
+	// TODO: simplify to take &ResolverRecord when record-based telemetry logging is complete
+	#[allow(clippy::too_many_arguments)]
 	pub fn log_characterization(&self, resolver: &str, label: &str, class: &str,
 		reachable: bool, latency_ms: f64, attempts_used: u32, successes: u32,
 		nxdomain: &str, rebinding: &str, dnssec: &str,
@@ -194,6 +196,8 @@ impl TelemetryLog {
 
 	//============================================
 	/// Log a qualification score for a single resolver.
+	// TODO: simplify to take &ResolverRecord when record-based telemetry logging is complete
+	#[allow(clippy::too_many_arguments)]
 	pub fn log_qualification(&self, resolver: &str, label: &str, class: &str,
 		score: f64, promoted: bool, p50_ms: f64, p95_ms: f64, timeout_rate: f64,
 	) {
@@ -219,6 +223,7 @@ impl TelemetryLog {
 
 	//============================================
 	/// Log per-resolver per-round summary stats after each round.
+	#[allow(clippy::too_many_arguments)]
 	pub fn log_round_resolver(&self, round: u32, resolver: &str,
 		queries: usize, successes: usize, timeouts: usize,
 		p50_ms: f64, mean_ms: f64, stddev_ms: f64,

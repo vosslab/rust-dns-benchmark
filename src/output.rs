@@ -7,6 +7,9 @@ use std::io::Write;
 use crate::record::ResolverRecord;
 use crate::transport::{BenchmarkConfig, Resolver};
 
+/// Phase timing entry: (name, duration, optional before/after resolver counts)
+pub type PhaseTimingEntry = (&'static str, std::time::Duration, Option<(usize, usize)>);
+
 /// Pick a color for a latency or score value (lower is better).
 fn latency_color(ms: f64) -> Color {
 	if ms < 30.0 {
@@ -166,7 +169,7 @@ pub fn print_results_table(results: &[ResolverRecord]) {
 	header.push("DNSSEC".to_string());
 	header.push("Rebind".to_string());
 
-	let header_cells: Vec<Cell> = header.iter().map(|h| Cell::new(h)).collect();
+	let header_cells: Vec<Cell> = header.iter().map(Cell::new).collect();
 	table.set_header(header_cells);
 
 	let mut has_ties = false;
@@ -299,7 +302,7 @@ pub fn print_pipeline_summary(
 
 /// Print a compact phase-by-phase timing breakdown.
 pub fn print_phase_timing(
-	phases: &[(&str, std::time::Duration, Option<(usize, usize)>)],
+	phases: &[PhaseTimingEntry],
 	total: std::time::Duration,
 ) {
 	println!("\nPhase Timing");
@@ -469,6 +472,14 @@ pub fn write_csv(path: &str, results: &[ResolverRecord]) -> Result<()> {
 		"success_rate".to_string(), "intercepts_nxdomain".to_string(),
 		"validates_dnssec".to_string(), "rebinding_protection".to_string(),
 		"ptr_name".to_string(), "tie_group".to_string(),
+		// Discovery stage columns
+		"discovery_latency_ms".to_string(), "discovery_reason".to_string(),
+		// Characterization stage columns
+		"char_reachable".to_string(), "char_attempts".to_string(),
+		"char_successes".to_string(), "char_latency_ms".to_string(),
+		// Qualification stage columns
+		"qual_score".to_string(), "qual_p50_ms".to_string(),
+		"qual_p95_ms".to_string(), "qual_timeout_rate".to_string(),
 	]);
 	writer.write_record(&header)?;
 
@@ -524,6 +535,56 @@ pub fn write_csv(path: &str, results: &[ResolverRecord]) -> Result<()> {
 		row.push(rebind_csv.to_string());
 		row.push(ptr_str);
 		row.push(tie_str);
+
+		// Discovery stage fields
+		let disc_latency = r.discovery.as_ref()
+			.and_then(|d| d.latency_ms)
+			.map(|ms| format!("{:.2}", ms))
+			.unwrap_or_default();
+		let disc_reason = r.discovery.as_ref()
+			.map(|d| d.reason.as_str())
+			.unwrap_or_default()
+			.to_string();
+		row.push(disc_latency);
+		row.push(disc_reason);
+
+		// Characterization stage fields
+		let char_reachable = r.characterization.as_ref()
+			.map(|c| if c.reachable { "true" } else { "false" })
+			.unwrap_or_default()
+			.to_string();
+		let char_attempts = r.characterization.as_ref()
+			.map(|c| c.attempts_used.to_string())
+			.unwrap_or_default();
+		let char_successes = r.characterization.as_ref()
+			.map(|c| c.successes.to_string())
+			.unwrap_or_default();
+		let char_latency = r.characterization.as_ref()
+			.and_then(|c| c.latency_ms)
+			.map(|ms| format!("{:.2}", ms))
+			.unwrap_or_default();
+		row.push(char_reachable);
+		row.push(char_attempts);
+		row.push(char_successes);
+		row.push(char_latency);
+
+		// Qualification stage fields (populated only in medium mode)
+		let qual_score = r.qualification.as_ref()
+			.map(|q| format!("{:.2}", q.score))
+			.unwrap_or_default();
+		let qual_p50 = r.qualification.as_ref()
+			.map(|q| format!("{:.2}", q.p50_ms))
+			.unwrap_or_default();
+		let qual_p95 = r.qualification.as_ref()
+			.map(|q| format!("{:.2}", q.p95_ms))
+			.unwrap_or_default();
+		let qual_timeout = r.qualification.as_ref()
+			.map(|q| format!("{:.4}", q.timeout_rate))
+			.unwrap_or_default();
+		row.push(qual_score);
+		row.push(qual_p50);
+		row.push(qual_p95);
+		row.push(qual_timeout);
 
 		writer.write_record(&row)?;
 	}

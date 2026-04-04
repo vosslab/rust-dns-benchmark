@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 /// Sort mode for ranking resolvers
 #[derive(Debug, Clone, Default)]
 pub enum SortMode {
@@ -241,6 +239,7 @@ pub fn rank_records(records: &mut [crate::record::ResolverRecord], sort_mode: &S
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::collections::BTreeMap;
 
 	#[test]
 	fn test_percentile_basic() {
