@@ -164,11 +164,14 @@ impl TelemetryLog {
 
 	//============================================
 	/// Log a discovery screening outcome for a single resolver.
-	pub fn log_discovery(&self, resolver: &str, label: &str, class: &str, passed: bool, reason: &str) {
+	pub fn log_discovery(&self, resolver: &str, label: &str, class: &str,
+		passed: bool, reason: &str, latency_ms: f64,
+	) {
 		let ts = timestamp_iso();
 		let line = format!(
-			r#"{{"event":"discovery","timestamp":"{}","resolver":"{}","label":"{}","class":"{}","passed":{},"reason":"{}"}}"#,
-			ts, json_escape(resolver), json_escape(label), json_escape(class), passed, json_escape(reason)
+			r#"{{"event":"discovery","timestamp":"{}","resolver":"{}","label":"{}","class":"{}","passed":{},"reason":"{}","latency_ms":{:.1}}}"#,
+			ts, json_escape(resolver), json_escape(label), json_escape(class),
+			passed, json_escape(reason), latency_ms
 		);
 		self.write_line(&line);
 	}
@@ -176,12 +179,14 @@ impl TelemetryLog {
 	//============================================
 	/// Log a characterization result for a single resolver.
 	pub fn log_characterization(&self, resolver: &str, label: &str, class: &str,
-		reachable: bool, nxdomain: &str, rebinding: &str, dnssec: &str,
+		reachable: bool, latency_ms: f64, attempts_used: u32, successes: u32,
+		nxdomain: &str, rebinding: &str, dnssec: &str,
 	) {
 		let ts = timestamp_iso();
 		let line = format!(
-			r#"{{"event":"characterization","timestamp":"{}","resolver":"{}","label":"{}","class":"{}","reachable":{},"nxdomain":"{}","rebinding":"{}","dnssec":"{}"}}"#,
+			r#"{{"event":"characterization","timestamp":"{}","resolver":"{}","label":"{}","class":"{}","reachable":{},"latency_ms":{:.1},"attempts_used":{},"successes":{},"nxdomain":"{}","rebinding":"{}","dnssec":"{}"}}"#,
 			ts, json_escape(resolver), json_escape(label), json_escape(class), reachable,
+			latency_ms, attempts_used, successes,
 			json_escape(nxdomain), json_escape(rebinding), json_escape(dnssec)
 		);
 		self.write_line(&line);
@@ -190,12 +195,13 @@ impl TelemetryLog {
 	//============================================
 	/// Log a qualification score for a single resolver.
 	pub fn log_qualification(&self, resolver: &str, label: &str, class: &str,
-		score: f64, promoted: bool,
+		score: f64, promoted: bool, p50_ms: f64, stddev_ms: f64, timeout_rate: f64,
 	) {
 		let ts = timestamp_iso();
 		let line = format!(
-			r#"{{"event":"qualification","timestamp":"{}","resolver":"{}","label":"{}","class":"{}","score":{:.1},"promoted":{}}}"#,
-			ts, json_escape(resolver), json_escape(label), json_escape(class), score, promoted
+			r#"{{"event":"qualification","timestamp":"{}","resolver":"{}","label":"{}","class":"{}","score":{:.1},"promoted":{},"p50_ms":{:.1},"stddev_ms":{:.1},"timeout_rate":{:.3}}}"#,
+			ts, json_escape(resolver), json_escape(label), json_escape(class),
+			score, promoted, p50_ms, stddev_ms, timeout_rate
 		);
 		self.write_line(&line);
 	}
@@ -214,12 +220,15 @@ impl TelemetryLog {
 	//============================================
 	/// Log per-resolver per-round summary stats after each round.
 	pub fn log_round_resolver(&self, round: u32, resolver: &str,
-		queries: usize, successes: usize, timeouts: usize, p50_ms: f64,
+		queries: usize, successes: usize, timeouts: usize,
+		p50_ms: f64, mean_ms: f64, stddev_ms: f64,
 	) {
 		let ts = timestamp_iso();
+		let success_rate = if queries > 0 { successes as f64 / queries as f64 * 100.0 } else { 0.0 };
 		let line = format!(
-			r#"{{"event":"round_resolver","timestamp":"{}","round":{},"resolver":"{}","queries":{},"successes":{},"timeouts":{},"p50_ms":{:.1}}}"#,
-			ts, round, json_escape(resolver), queries, successes, timeouts, p50_ms
+			r#"{{"event":"round_resolver","timestamp":"{}","round":{},"resolver":"{}","queries":{},"successes":{},"timeouts":{},"success_rate":{:.1},"p50_ms":{:.1},"mean_ms":{:.1},"stddev_ms":{:.1}}}"#,
+			ts, round, json_escape(resolver), queries, successes, timeouts,
+			success_rate, p50_ms, mean_ms, stddev_ms
 		);
 		self.write_line(&line);
 	}

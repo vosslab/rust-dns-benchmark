@@ -34,37 +34,6 @@ pub struct SetStats {
 	pub score: f64,
 }
 
-/// Full resolver statistics with dynamic category sets
-#[derive(Debug, Clone)]
-pub struct ResolverStats {
-	pub label: String,
-	pub addr: String,
-	/// Transport protocol label ("UDP", "DoT", "DoH")
-	pub transport: String,
-	/// Per-category statistics, keyed by category name (e.g. "cached", "tld")
-	pub categories: BTreeMap<String, SetStats>,
-	pub overall_score: f64,
-	pub success_rate: f64,
-	pub intercepts_nxdomain: bool,
-	pub is_system: bool,
-	/// Reverse DNS (PTR) hostname for resolver IP
-	pub ptr_name: Option<String>,
-	/// Whether the resolver has DNS rebinding protection
-	pub rebinding_protection: Option<bool>,
-	/// Whether the resolver validates DNSSEC
-	pub validates_dnssec: Option<bool>,
-}
-
-/// Scored and ranked resolver
-#[derive(Debug, Clone)]
-pub struct ScoredResolver {
-	pub rank: usize,
-	pub stats: ResolverStats,
-	/// Whether this resolver is a system resolver (for pinning)
-	pub is_system: bool,
-	/// Tie group label (e.g. "1-3") when resolvers are statistically tied
-	pub tie_group: Option<String>,
-}
 
 /// Calculate the p-th percentile from a sorted slice using nearest-rank method.
 ///
@@ -184,31 +153,28 @@ pub fn compute_uncertainty(latencies_ms: &[f64]) -> f64 {
 	1.4826 * mad
 }
 
-/// Detect ties among ranked resolvers based on overlapping uncertainty bands.
+/// Detect ties among ranked resolver records based on overlapping uncertainty bands.
 ///
 /// For consecutive pairs: if |score_a - score_b| < uncertainty_a + uncertainty_b,
 /// they are tied. Groups tied resolvers and assigns shared rank labels.
-pub fn detect_ties(resolvers: &mut [ScoredResolver], uncertainties: &[f64]) {
-	if resolvers.len() < 2 || uncertainties.len() != resolvers.len() {
+pub fn detect_ties_on_records(records: &mut [crate::record::ResolverRecord], uncertainties: &[f64]) {
+	if records.len() < 2 || uncertainties.len() != records.len() {
 		return;
 	}
 
-	// Build tie groups using a union-find approach on consecutive pairs
-	let n = resolvers.len();
+	let n = records.len();
 	let mut group_id: Vec<usize> = (0..n).collect();
 
 	// Check consecutive pairs for overlap
 	for i in 0..(n - 1) {
-		let score_a = resolvers[i].stats.overall_score;
-		let score_b = resolvers[i + 1].stats.overall_score;
+		let score_a = records[i].benchmark.as_ref().map(|b| b.overall_score).unwrap_or(f64::INFINITY);
+		let score_b = records[i + 1].benchmark.as_ref().map(|b| b.overall_score).unwrap_or(f64::INFINITY);
 		let diff = (score_a - score_b).abs();
 		let threshold = uncertainties[i] + uncertainties[i + 1];
 
 		if diff < threshold {
-			// Merge into same group (use the earlier group ID)
 			let target = group_id[i];
 			let source = group_id[i + 1];
-			// Propagate group membership
 			for g in group_id.iter_mut() {
 				if *g == source {
 					*g = target;
@@ -221,7 +187,6 @@ pub fn detect_ties(resolvers: &mut [ScoredResolver], uncertainties: &[f64]) {
 	let mut i = 0;
 	while i < n {
 		let gid = group_id[i];
-		// Find all members of this group
 		let members: Vec<usize> = (0..n).filter(|&j| group_id[j] == gid).collect();
 
 		if members.len() > 1 {
@@ -229,7 +194,9 @@ pub fn detect_ties(resolvers: &mut [ScoredResolver], uncertainties: &[f64]) {
 			let last_rank = members[members.len() - 1] + 1;
 			let label = format!("{}-{}", first_rank, last_rank);
 			for &m in &members {
-				resolvers[m].tie_group = Some(label.clone());
+				if let Some(ref mut bm) = records[m].benchmark {
+					bm.tie_group = Some(label.clone());
+				}
 			}
 		}
 
@@ -237,41 +204,38 @@ pub fn detect_ties(resolvers: &mut [ScoredResolver], uncertainties: &[f64]) {
 	}
 }
 
-/// Rank resolvers by the chosen sort mode, ascending.
-///
-/// Lower scores/latencies are better for all numeric modes.
-pub fn rank_resolvers(mut resolvers: Vec<ResolverStats>, sort_mode: &SortMode) -> Vec<ScoredResolver> {
+/// Rank resolver records by the chosen sort mode, ascending.
+/// Sets benchmark.rank on each record. Lower scores/latencies are better.
+pub fn rank_records(records: &mut Vec<crate::record::ResolverRecord>, sort_mode: &SortMode) {
 	let cmp_f64 = |a: f64, b: f64| -> std::cmp::Ordering {
 		a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
 	};
+
 	match sort_mode {
 		SortMode::Score => {
-			resolvers.sort_by(|a, b| cmp_f64(a.overall_score, b.overall_score));
+			records.sort_by(|a, b| {
+				let sa = a.benchmark.as_ref().map(|bm| bm.overall_score).unwrap_or(f64::INFINITY);
+				let sb = b.benchmark.as_ref().map(|bm| bm.overall_score).unwrap_or(f64::INFINITY);
+				cmp_f64(sa, sb)
+			});
 		}
 		SortMode::Category(name) => {
-			// Sort by the named category's p50; resolvers without it sort to end
-			resolvers.sort_by(|a, b| {
-				let a_val = a.categories.get(name).map(|s| s.p50_ms).unwrap_or(f64::MAX);
-				let b_val = b.categories.get(name).map(|s| s.p50_ms).unwrap_or(f64::MAX);
-				cmp_f64(a_val, b_val)
+			records.sort_by(|a, b| {
+				let va = a.benchmark.as_ref().and_then(|bm| bm.categories.get(name)).map(|s| s.p50_ms).unwrap_or(f64::MAX);
+				let vb = b.benchmark.as_ref().and_then(|bm| bm.categories.get(name)).map(|s| s.p50_ms).unwrap_or(f64::MAX);
+				cmp_f64(va, vb)
 			});
 		}
 		SortMode::Name => {
-			resolvers.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+			records.sort_by(|a, b| a.resolver.label.to_lowercase().cmp(&b.resolver.label.to_lowercase()));
 		}
 	}
-	resolvers.into_iter()
-		.enumerate()
-		.map(|(i, stats)| {
-			let is_system = stats.is_system;
-			ScoredResolver {
-				rank: i + 1,
-				stats,
-				is_system,
-				tie_group: None,
-			}
-		})
-		.collect()
+	// Set rank on each record's benchmark result
+	for (i, rec) in records.iter_mut().enumerate() {
+		if let Some(ref mut bm) = rec.benchmark {
+			bm.rank = i + 1;
+		}
+	}
 }
 
 #[cfg(test)]
@@ -347,46 +311,40 @@ mod tests {
 		assert!((score - 535.0).abs() < 0.01);
 	}
 
-	/// Helper to build a minimal ResolverStats for testing
-	fn make_test_stats(label: &str, overall_score: f64, success_rate: f64) -> ResolverStats {
-		ResolverStats {
-			label: label.to_string(),
-			addr: "0.0.0.0".to_string(),
-			transport: "UDP".to_string(),
+	/// Helper to build a minimal ResolverRecord for testing
+	fn make_test_record(label: &str, overall_score: f64, success_rate: f64) -> crate::record::ResolverRecord {
+		use crate::transport::{Resolver, DnsTransport};
+		let mut resolver = Resolver::new("0.0.0.0:53".parse().unwrap(), DnsTransport::Udp);
+		resolver.label = label.to_string();
+		let mut rec = crate::record::ResolverRecord::new(resolver);
+		rec.benchmark = Some(crate::record::BenchmarkResult {
 			categories: BTreeMap::new(),
 			overall_score,
 			success_rate,
-			intercepts_nxdomain: false,
-			is_system: false,
-			ptr_name: None,
-			rebinding_protection: None,
-			validates_dnssec: None,
-		}
+			rank: 0,
+			tie_group: None,
+		});
+		rec
 	}
 
 	#[test]
 	fn test_ranking_order() {
-		let resolvers = vec![
-			make_test_stats("slow", 100.0, 95.0),
-			make_test_stats("fast", 10.0, 99.0),
-			make_test_stats("medium", 50.0, 97.0),
+		let mut records = vec![
+			make_test_record("slow", 100.0, 95.0),
+			make_test_record("fast", 10.0, 99.0),
+			make_test_record("medium", 50.0, 97.0),
 		];
-		let ranked = rank_resolvers(resolvers, &SortMode::Score);
-		assert_eq!(ranked[0].rank, 1);
-		assert_eq!(ranked[0].stats.label, "fast");
-		assert_eq!(ranked[1].rank, 2);
-		assert_eq!(ranked[1].stats.label, "medium");
-		assert_eq!(ranked[2].rank, 3);
-		assert_eq!(ranked[2].stats.label, "slow");
+		rank_records(&mut records, &SortMode::Score);
+		assert_eq!(records[0].benchmark.as_ref().unwrap().rank, 1);
+		assert_eq!(records[0].resolver.label, "fast");
+		assert_eq!(records[1].resolver.label, "medium");
+		assert_eq!(records[2].resolver.label, "slow");
 	}
 
 	#[test]
 	fn test_compute_uncertainty_basic() {
-		// Symmetric data: deviations from median=5 are [4,3,2,1,0,1,2,3,4]
 		let values = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
 		let uncertainty = compute_uncertainty(&values);
-		// MAD of abs deviations [0,1,1,2,2,3,3,4,4] = median = 2
-		// uncertainty = 1.4826 * 2 = 2.9652
 		assert!((uncertainty - 2.9652).abs() < 0.01);
 	}
 
@@ -404,72 +362,50 @@ mod tests {
 
 	#[test]
 	fn test_detect_ties_close_scores() {
-		let mut resolvers = vec![
-			ScoredResolver {
-				rank: 1,
-				stats: make_test_stats("a", 10.0, 99.0),
-				is_system: false,
-				tie_group: None,
-			},
-			ScoredResolver {
-				rank: 2,
-				stats: make_test_stats("b", 11.0, 98.0),
-				is_system: false,
-				tie_group: None,
-			},
-			ScoredResolver {
-				rank: 3,
-				stats: make_test_stats("c", 50.0, 95.0),
-				is_system: false,
-				tie_group: None,
-			},
+		let mut records = vec![
+			make_test_record("a", 10.0, 99.0),
+			make_test_record("b", 11.0, 98.0),
+			make_test_record("c", 50.0, 95.0),
 		];
-		// Large uncertainties for a and b, small for c
+		rank_records(&mut records, &SortMode::Score);
 		let uncertainties = vec![5.0, 5.0, 0.1];
-		detect_ties(&mut resolvers, &uncertainties);
+		detect_ties_on_records(&mut records, &uncertainties);
 
 		// a and b should be tied (diff=1, threshold=10)
-		assert_eq!(resolvers[0].tie_group, Some("1-2".to_string()));
-		assert_eq!(resolvers[1].tie_group, Some("1-2".to_string()));
-		// c should not be tied
-		assert_eq!(resolvers[2].tie_group, None);
+		assert_eq!(records[0].benchmark.as_ref().unwrap().tie_group, Some("1-2".to_string()));
+		assert_eq!(records[1].benchmark.as_ref().unwrap().tie_group, Some("1-2".to_string()));
+		assert_eq!(records[2].benchmark.as_ref().unwrap().tie_group, None);
 	}
 
 	#[test]
 	fn test_detect_ties_no_ties() {
-		let mut resolvers = vec![
-			ScoredResolver {
-				rank: 1,
-				stats: make_test_stats("a", 10.0, 99.0),
-				is_system: false,
-				tie_group: None,
-			},
-			ScoredResolver {
-				rank: 2,
-				stats: make_test_stats("b", 100.0, 95.0),
-				is_system: false,
-				tie_group: None,
-			},
+		let mut records = vec![
+			make_test_record("a", 10.0, 99.0),
+			make_test_record("b", 100.0, 95.0),
 		];
-		// Very small uncertainties
+		rank_records(&mut records, &SortMode::Score);
 		let uncertainties = vec![0.1, 0.1];
-		detect_ties(&mut resolvers, &uncertainties);
+		detect_ties_on_records(&mut records, &uncertainties);
 
-		assert_eq!(resolvers[0].tie_group, None);
-		assert_eq!(resolvers[1].tie_group, None);
+		assert_eq!(records[0].benchmark.as_ref().unwrap().tie_group, None);
+		assert_eq!(records[1].benchmark.as_ref().unwrap().tie_group, None);
 	}
 
 	#[test]
 	fn test_sort_by_category() {
-		let mut stats_a = make_test_stats("a", 10.0, 99.0);
-		stats_a.categories.insert("cached".to_string(), SetStats { p50_ms: 50.0, ..Default::default() });
-		let mut stats_b = make_test_stats("b", 20.0, 99.0);
-		stats_b.categories.insert("cached".to_string(), SetStats { p50_ms: 10.0, ..Default::default() });
+		let mut rec_a = make_test_record("a", 10.0, 99.0);
+		rec_a.benchmark.as_mut().unwrap().categories.insert(
+			"cached".to_string(), SetStats { p50_ms: 50.0, ..Default::default() },
+		);
+		let mut rec_b = make_test_record("b", 20.0, 99.0);
+		rec_b.benchmark.as_mut().unwrap().categories.insert(
+			"cached".to_string(), SetStats { p50_ms: 10.0, ..Default::default() },
+		);
 
-		let resolvers = vec![stats_a, stats_b];
-		let ranked = rank_resolvers(resolvers, &SortMode::Category("cached".to_string()));
+		let mut records = vec![rec_a, rec_b];
+		rank_records(&mut records, &SortMode::Category("cached".to_string()));
 		// b has lower cached p50, should rank first
-		assert_eq!(ranked[0].stats.label, "b");
-		assert_eq!(ranked[1].stats.label, "a");
+		assert_eq!(records[0].resolver.label, "b");
+		assert_eq!(records[1].resolver.label, "a");
 	}
 }

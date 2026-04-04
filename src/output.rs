@@ -4,8 +4,8 @@ use comfy_table::{Table, ContentArrangement, Cell, Color, Attribute, presets::UT
 use anyhow::Result;
 use std::io::Write;
 
-use crate::stats::ScoredResolver;
-use crate::transport::{BenchmarkConfig, ResolverConfig};
+use crate::record::ResolverRecord;
+use crate::transport::{BenchmarkConfig, Resolver};
 
 /// Pick a color for a latency or score value (lower is better).
 fn latency_color(ms: f64) -> Color {
@@ -36,7 +36,7 @@ fn success_color(pct: f64) -> Color {
 /// 2. Query domains (websites queried against each resolver)
 /// 3. Timing and options (benchmark parameters)
 pub fn print_config_summary(
-	resolvers: &[ResolverConfig],
+	resolvers: &[Resolver],
 	categories: &BTreeMap<String, Vec<String>>,
 	config: &BenchmarkConfig,
 ) {
@@ -125,18 +125,20 @@ pub fn print_config_summary(
 }
 
 /// Collect the ordered list of category names present in results.
-fn result_category_names(results: &[ScoredResolver]) -> Vec<String> {
+fn result_category_names(results: &[ResolverRecord]) -> Vec<String> {
 	let mut names: BTreeMap<String, ()> = BTreeMap::new();
 	for r in results {
-		for key in r.stats.categories.keys() {
-			names.entry(key.clone()).or_default();
+		if let Some(ref bm) = r.benchmark {
+			for key in bm.categories.keys() {
+				names.entry(key.clone()).or_default();
+			}
 		}
 	}
 	names.into_keys().collect()
 }
 
 /// Print the benchmark results as a formatted table with color coding.
-pub fn print_results_table(results: &[ScoredResolver]) {
+pub fn print_results_table(results: &[ResolverRecord]) {
 	let category_names = result_category_names(results);
 
 	let mut table = Table::new();
@@ -145,7 +147,7 @@ pub fn print_results_table(results: &[ScoredResolver]) {
 
 	// Check if any resolvers use non-UDP transport
 	let has_mixed_transport = results.iter()
-		.any(|r| r.stats.transport != "UDP");
+		.any(|r| r.resolver.transport.to_string() != "UDP");
 
 	// Build header dynamically
 	let mut header: Vec<String> = vec![
@@ -169,42 +171,45 @@ pub fn print_results_table(results: &[ScoredResolver]) {
 
 	let mut has_ties = false;
 	for r in results {
-		let s = &r.stats;
+		let bm = match &r.benchmark {
+			Some(bm) => bm,
+			None => continue,
+		};
 
 		// Rank display: show tie group label if tied
-		let rank_str = match &r.tie_group {
+		let rank_str = match &bm.tie_group {
 			Some(group) => {
 				has_ties = true;
 				group.clone()
 			}
-			None => format!("{}", r.rank),
+			None => format!("{}", bm.rank),
 		};
 
 		// Color the rank cell based on position
-		let rank_cell = if r.rank <= 3 {
+		let rank_cell = if bm.rank <= 3 {
 			Cell::new(rank_str).fg(Color::Green).add_attribute(Attribute::Bold)
-		} else if r.rank <= 10 {
+		} else if bm.rank <= 10 {
 			Cell::new(rank_str).add_attribute(Attribute::Bold)
 		} else {
 			Cell::new(rank_str)
 		};
 
 		// NXDOMAIN status with color
-		let nxdomain_cell = if s.intercepts_nxdomain {
+		let nxdomain_cell = if r.intercepts_nxdomain() {
 			Cell::new("Intercepts").fg(Color::Red)
 		} else {
 			Cell::new("OK").fg(Color::Green)
 		};
 
 		// Build label with optional system marker and PTR name
-		let mut label = s.label.clone();
-		if let Some(ref ptr) = s.ptr_name {
+		let mut label = r.resolver.label.clone();
+		if let Some(ref ptr) = r.resolver.ptr_name {
 			// Only show PTR if it differs from the label
-			if ptr != &s.label {
+			if ptr != &r.resolver.label {
 				label = format!("{} ({})", label, ptr);
 			}
 		}
-		if r.is_system {
+		if r.resolver.is_system {
 			label = format!("{} [sys]", label);
 		}
 
@@ -212,19 +217,19 @@ pub fn print_results_table(results: &[ScoredResolver]) {
 		let mut row: Vec<Cell> = vec![
 			rank_cell,
 			Cell::new(label),
-			Cell::new(s.addr.clone()),
+			Cell::new(r.resolver.addr.ip().to_string()),
 		];
 		if has_mixed_transport {
-			row.push(Cell::new(s.transport.clone()));
+			row.push(Cell::new(r.resolver.transport.to_string()));
 		}
 
 		// Score cell with color
-		let score_text = format!("{:.1}", s.overall_score);
-		row.push(Cell::new(&score_text).fg(latency_color(s.overall_score)));
+		let score_text = format!("{:.1}", bm.overall_score);
+		row.push(Cell::new(&score_text).fg(latency_color(bm.overall_score)));
 
 		// Category p50 columns
 		for cat in &category_names {
-			if let Some(cat_stats) = s.categories.get(cat) {
+			if let Some(cat_stats) = bm.categories.get(cat) {
 				let text = format!("{:.1} ms", cat_stats.p50_ms);
 				row.push(Cell::new(&text).fg(latency_color(cat_stats.p50_ms)));
 			} else {
@@ -233,13 +238,13 @@ pub fn print_results_table(results: &[ScoredResolver]) {
 		}
 
 		// Success rate with color
-		let success_text = format!("{:.1}%", s.success_rate);
-		row.push(Cell::new(&success_text).fg(success_color(s.success_rate)));
+		let success_text = format!("{:.1}%", bm.success_rate);
+		row.push(Cell::new(&success_text).fg(success_color(bm.success_rate)));
 
 		row.push(nxdomain_cell);
 
 		// DNSSEC cell with color
-		let dnssec_cell = match s.validates_dnssec {
+		let dnssec_cell = match r.validates_dnssec() {
 			Some(true) => Cell::new("Yes").fg(Color::Green),
 			Some(false) => Cell::new("No"),
 			None => Cell::new("-").fg(Color::DarkGrey),
@@ -247,7 +252,7 @@ pub fn print_results_table(results: &[ScoredResolver]) {
 		row.push(dnssec_cell);
 
 		// Rebinding protection cell with color
-		let rebind_cell = match s.rebinding_protection {
+		let rebind_cell = match r.rebinding_protection() {
 			Some(true) => Cell::new("Yes").fg(Color::Green),
 			Some(false) => Cell::new("No"),
 			None => Cell::new("-").fg(Color::DarkGrey),
@@ -316,7 +321,7 @@ pub fn print_phase_timing(
 }
 
 /// Print heuristic conclusions about the benchmark results.
-pub fn print_conclusions(results: &[ScoredResolver]) {
+pub fn print_conclusions(results: &[ResolverRecord]) {
 	if results.is_empty() {
 		return;
 	}
@@ -325,41 +330,45 @@ pub fn print_conclusions(results: &[ScoredResolver]) {
 
 	// Find the best resolver overall
 	let best = &results[0];
-	println!("Fastest resolver: {} (score {:.1})", best.stats.label, best.stats.overall_score);
+	let best_score = best.benchmark.as_ref().map(|b| b.overall_score).unwrap_or(f64::INFINITY);
+	println!("Fastest resolver: {} (score {:.1})", best.resolver.label, best_score);
 
 	// Report on system resolvers
 	let total = results.len();
 	for r in results {
-		if !r.is_system {
+		if !r.resolver.is_system {
 			continue;
 		}
+		let bm = match &r.benchmark {
+			Some(bm) => bm,
+			None => continue,
+		};
 		println!(
 			"Your system resolver {} ranked #{} out of {} tested.",
-			r.stats.label, r.rank, total,
+			r.resolver.label, bm.rank, total,
 		);
 		// Compare to best
-		if r.rank > 1 && best.stats.overall_score > 0.0 {
-			let pct_slower = ((r.stats.overall_score - best.stats.overall_score)
-				/ best.stats.overall_score) * 100.0;
+		if bm.rank > 1 && best_score > 0.0 {
+			let pct_slower = ((bm.overall_score - best_score) / best_score) * 100.0;
 			if pct_slower > 20.0 {
 				println!(
 					"  Switching to {} could improve DNS performance by ~{:.0}%.",
-					best.stats.label, pct_slower,
+					best.resolver.label, pct_slower,
 				);
 			}
 		}
 		// Warn about NXDOMAIN interception on system resolver
-		if r.stats.intercepts_nxdomain {
+		if r.intercepts_nxdomain() {
 			println!(
 				"  Warning: {} intercepts NXDOMAIN queries (ad-redirect behavior).",
-				r.stats.label,
+				r.resolver.label,
 			);
 		}
 		// Warn about missing DNSSEC validation
-		if r.stats.validates_dnssec == Some(false) {
+		if r.validates_dnssec() == Some(false) {
 			println!(
 				"  Warning: {} does not validate DNSSEC signatures.",
-				r.stats.label,
+				r.resolver.label,
 			);
 		}
 	}
@@ -368,7 +377,8 @@ pub fn print_conclusions(results: &[ScoredResolver]) {
 	let first_cat = result_category_names(results).into_iter().next();
 	if let Some(cat_name) = first_cat {
 		let all_slow = results.iter().all(|r| {
-			r.stats.categories.get(&cat_name)
+			r.benchmark.as_ref()
+				.and_then(|bm| bm.categories.get(&cat_name))
 				.map(|s| s.p50_ms > 100.0)
 				.unwrap_or(true)
 		});
@@ -381,27 +391,29 @@ pub fn print_conclusions(results: &[ScoredResolver]) {
 	let first_cat_name = result_category_names(results).into_iter().next();
 	let mut pairs_printed = false;
 	for r in results {
+		let bm = match &r.benchmark { Some(bm) => bm, None => continue };
 		// Look for a matching -v6 suffix entry
-		let base_label = r.stats.label.trim_end_matches("-v6");
-		if base_label == r.stats.label {
+		let base_label = r.resolver.label.trim_end_matches("-v6");
+		if base_label == r.resolver.label {
 			// This is the IPv4 entry; look for the v6 pair
-			let v6_label = format!("{}-v6", r.stats.label);
-			if let Some(v6) = results.iter().find(|x| x.stats.label == v6_label) {
+			let v6_label = format!("{}-v6", r.resolver.label);
+			if let Some(v6) = results.iter().find(|x| x.resolver.label == v6_label) {
+				let v6_bm = match &v6.benchmark { Some(bm) => bm, None => continue };
 				if !pairs_printed {
 					println!("\nIPv4 vs IPv6 Comparison");
 					println!("----------------------");
 					pairs_printed = true;
 				}
-				let diff_pct = if r.stats.overall_score > 0.0 {
-					((v6.stats.overall_score - r.stats.overall_score) / r.stats.overall_score) * 100.0
+				let diff_pct = if bm.overall_score > 0.0 {
+					((v6_bm.overall_score - bm.overall_score) / bm.overall_score) * 100.0
 				} else {
 					0.0
 				};
 				let direction = if diff_pct > 0.0 { "slower" } else { "faster" };
 				// Use first category p50 for the comparison display
 				if let Some(ref cat) = first_cat_name {
-					let v4_p50 = r.stats.categories.get(cat).map(|s| s.p50_ms).unwrap_or(0.0);
-					let v6_p50 = v6.stats.categories.get(cat).map(|s| s.p50_ms).unwrap_or(0.0);
+					let v4_p50 = bm.categories.get(cat).map(|s| s.p50_ms).unwrap_or(0.0);
+					let v6_p50 = v6_bm.categories.get(cat).map(|s| s.p50_ms).unwrap_or(0.0);
 					println!("  {} IPv4: {:.1} ms vs IPv6: {:.1} ms ({:.0}% {})",
 						base_label, v4_p50, v6_p50, diff_pct.abs(), direction);
 				}
@@ -411,7 +423,7 @@ pub fn print_conclusions(results: &[ScoredResolver]) {
 }
 
 /// Write benchmark results to a CSV file.
-pub fn write_csv(path: &str, results: &[ScoredResolver]) -> Result<()> {
+pub fn write_csv(path: &str, results: &[ResolverRecord]) -> Result<()> {
 	let category_names = result_category_names(results);
 	let mut writer = csv::Writer::from_path(path)?;
 
@@ -439,23 +451,23 @@ pub fn write_csv(path: &str, results: &[ScoredResolver]) -> Result<()> {
 	writer.write_record(&header)?;
 
 	for r in results {
-		let s = &r.stats;
-		let rank_str = match &r.tie_group {
+		let bm = match &r.benchmark { Some(bm) => bm, None => continue };
+		let rank_str = match &bm.tie_group {
 			Some(group) => group.clone(),
-			None => r.rank.to_string(),
+			None => bm.rank.to_string(),
 		};
 
 		let mut row = vec![
 			rank_str,
-			s.label.clone(),
-			s.addr.clone(),
-			s.transport.clone(),
-			format!("{:.2}", s.overall_score),
+			r.resolver.label.clone(),
+			r.resolver.addr.ip().to_string(),
+			r.resolver.transport.to_string(),
+			format!("{:.2}", bm.overall_score),
 		];
 
 		// Category columns
 		for cat in &category_names {
-			if let Some(cs) = s.categories.get(cat) {
+			if let Some(cs) = bm.categories.get(cat) {
 				row.extend_from_slice(&[
 					format!("{:.2}", cs.p50_ms),
 					format!("{:.2}", cs.p95_ms),
@@ -475,16 +487,16 @@ pub fn write_csv(path: &str, results: &[ScoredResolver]) -> Result<()> {
 			}
 		}
 
-		let intercepts_str = if s.intercepts_nxdomain { "true" } else { "false" };
-		let dnssec_csv = match s.validates_dnssec {
+		let intercepts_str = if r.intercepts_nxdomain() { "true" } else { "false" };
+		let dnssec_csv = match r.validates_dnssec() {
 			Some(true) => "true", Some(false) => "false", None => "",
 		};
-		let rebind_csv = match s.rebinding_protection {
+		let rebind_csv = match r.rebinding_protection() {
 			Some(true) => "true", Some(false) => "false", None => "",
 		};
-		let ptr_str = s.ptr_name.clone().unwrap_or_default();
-		let tie_str = r.tie_group.clone().unwrap_or_default();
-		row.push(format!("{:.1}", s.success_rate));
+		let ptr_str = r.resolver.ptr_name.clone().unwrap_or_default();
+		let tie_str = bm.tie_group.clone().unwrap_or_default();
+		row.push(format!("{:.1}", bm.success_rate));
 		row.push(intercepts_str.to_string());
 		row.push(dnssec_csv.to_string());
 		row.push(rebind_csv.to_string());
@@ -500,13 +512,12 @@ pub fn write_csv(path: &str, results: &[ScoredResolver]) -> Result<()> {
 }
 
 /// Save surviving resolver addresses to a file (one per line, IP  # Label).
-pub fn write_resolver_list(path: &str, results: &[ScoredResolver]) -> Result<()> {
+pub fn write_resolver_list(path: &str, results: &[ResolverRecord]) -> Result<()> {
 	let mut file = std::fs::File::create(path)?;
 	writeln!(file, "# DNS Benchmark - surviving resolvers (ranked by performance)")?;
 	for r in results {
-		let s = &r.stats;
 		// Write in resolver file format: address  # Label
-		writeln!(file, "{}  # {}", s.addr, s.label)?;
+		writeln!(file, "{}  # {}", r.resolver.addr.ip(), r.resolver.label)?;
 	}
 	println!("\nResolver list written to: {}", path);
 	Ok(())

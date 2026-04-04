@@ -16,8 +16,7 @@ use rustls::ClientConfig;
 use tokio_rustls::TlsConnector;
 
 use crate::transport::{
-	DnsTransport, ResolverConfig, QueryType, QueryResult, BenchmarkConfig,
-	resolver_class,
+	DnsTransport, Resolver, QueryType, QueryResult, BenchmarkConfig,
 };
 
 /// Timeout for Phase 1 discovery reachability screen -- UDP (ms)
@@ -34,8 +33,8 @@ use crate::dns::{
 	check_rebinding_protection, check_dnssec_validation,
 };
 use crate::stats::{
-	compute_set_stats, compute_uncertainty, detect_ties,
-	rank_resolvers, ResolverStats, ScoredResolver,
+	compute_set_stats, compute_uncertainty, detect_ties_on_records,
+	rank_records,
 };
 
 use tokio::task::JoinHandle;
@@ -444,7 +443,7 @@ async fn send_doh_query(
 
 /// Dispatch a query to the appropriate transport based on resolver config.
 async fn dispatch_query(
-	resolver: &ResolverConfig,
+	resolver: &Resolver,
 	query_bytes: &[u8],
 	timeout: Duration,
 	txid: u16,
@@ -470,7 +469,7 @@ async fn dispatch_query(
 }
 
 /// Build a DoH client pool with one reqwest::Client per DoH resolver URL.
-pub fn build_doh_client_pool(resolvers: &[ResolverConfig]) -> DohClientPool {
+pub fn build_doh_client_pool(resolvers: &[Resolver]) -> DohClientPool {
 	let mut pool = HashMap::new();
 	for r in resolvers {
 		if let DnsTransport::Doh { url } = &r.transport {
@@ -489,7 +488,7 @@ pub fn build_doh_client_pool(resolvers: &[ResolverConfig]) -> DohClientPool {
 /// A single query task: resolver + domain + query type + set membership
 #[derive(Clone, Debug)]
 struct QueryTask {
-	resolver: ResolverConfig,
+	resolver: Resolver,
 	domain: String,
 	query_type: QueryType,
 	set_name: String,
@@ -500,7 +499,7 @@ struct QueryTask {
 /// Sends a single probe query per resolver for a known-bad domain.
 /// If the resolver returns NoError with A records, it is marked as intercepting.
 pub async fn run_characterization(
-	resolvers: &mut Vec<ResolverConfig>,
+	records: &mut Vec<crate::record::ResolverRecord>,
 	config: &BenchmarkConfig,
 	nxdomain_domains: &[String],
 ) {
@@ -510,10 +509,10 @@ pub async fn run_characterization(
 	let char_timeout = Duration::from_millis(crate::transport::DEFAULT_CHAR_TIMEOUT_MS);
 	let char_attempts = crate::transport::DEFAULT_CHAR_ATTEMPTS;
 	println!("Reachability pre-check ({} resolvers, {} attempts, {} ms timeout)...",
-		resolvers.len(), char_attempts, char_timeout.as_millis());
+		records.len(), char_attempts, char_timeout.as_millis());
 
 	let semaphore = std::sync::Arc::new(Semaphore::new(32));
-	let phase0_total = resolvers.len();
+	let phase0_total = records.len();
 	let phase0_done = Arc::new(AtomicUsize::new(0));
 	let phase0_start = Instant::now();
 	let monitor = spawn_progress_monitor(
@@ -521,8 +520,8 @@ pub async fn run_characterization(
 	);
 
 	let mut reachability_handles = Vec::new();
-	for (i, resolver) in resolvers.iter().enumerate() {
-		let addr = resolver.addr;
+	for (i, rec) in records.iter().enumerate() {
+		let addr = rec.resolver.addr;
 		let sem = semaphore.clone();
 		let ct = char_timeout;
 		let attempts = char_attempts;
@@ -531,7 +530,11 @@ pub async fn run_characterization(
 		reachability_handles.push(tokio::spawn(async move {
 			let _permit = sem.acquire().await.unwrap();
 			let mut any_fast = false;
+			let mut success_latencies: Vec<f64> = Vec::with_capacity(3);
+			let mut attempts_tried = 0u32;
+			// Collect up to 3 successful latencies for median calculation
 			for _ in 0..attempts {
+				attempts_tried += 1;
 				let txid: u16 = rand::random();
 				let query_bytes = match crate::dns::build_query(
 					"google.com", crate::transport::QueryType::A, txid, false,
@@ -542,19 +545,34 @@ pub async fn run_characterization(
 				let result = send_udp_query(addr, &query_bytes, ct, txid, "google.com", crate::transport::QueryType::A).await;
 				if result.success {
 					any_fast = true;
-					break;
+					success_latencies.push(result.latency.as_secs_f64() * 1000.0);
+					// Stop once we have 3 successes
+					if success_latencies.len() >= 3 {
+						break;
+					}
 				}
 			}
 			done.fetch_add(1, Ordering::Relaxed);
-			(i, any_fast)
+			(i, any_fast, success_latencies, attempts_tried)
 		}));
 	}
 
-	let mut reachable = vec![false; resolvers.len()];
+	let mut reachable = vec![false; records.len()];
+	let mut reach_latency = vec![0.0f64; records.len()];
+	let mut reach_attempts_used = vec![0u32; records.len()];
+	let mut reach_successes = vec![0u32; records.len()];
 	for handle in reachability_handles {
 		match handle.await {
-			Ok((idx, is_reachable)) => {
+			Ok((idx, is_reachable, mut success_latencies, attempts_tried)) => {
 				reachable[idx] = is_reachable;
+				reach_successes[idx] = success_latencies.len() as u32;
+				// Compute median latency from successful attempts
+				if !success_latencies.is_empty() {
+					success_latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+					let mid = success_latencies.len() / 2;
+					reach_latency[idx] = success_latencies[mid];
+				}
+				reach_attempts_used[idx] = attempts_tried;
 			}
 			Err(e) => {
 				eprintln!("Warning: reachability check failed: {}", e);
@@ -563,33 +581,38 @@ pub async fn run_characterization(
 	}
 	stop_progress_monitor(monitor, "Reachability", phase0_total, phase0_start);
 
-	// Log reachability results and remove unreachable resolvers
-	let before = resolvers.len();
-	for (i, resolver) in resolvers.iter().enumerate() {
+	// Log reachability results and remove unreachable records
+	let before = records.len();
+	for (i, rec) in records.iter().enumerate() {
 		if !reachable[i] {
 			config.telemetry.log_sidelined(
-				&resolver.addr.ip().to_string(), "reachability_precheck", 0,
+				&rec.resolver.addr.ip().to_string(), "reachability_precheck", 0,
 			);
-			let class = resolver_class(resolver);
+			let class = rec.resolver.class;
 			if class != "public" {
 				println!("  {} {} ({}) -- sidelined (reachability precheck)",
-					class, resolver.label, resolver.addr.ip());
+					class, rec.resolver.label, rec.resolver.addr.ip());
 			}
 		}
 	}
+	// Build reachability stats map before removing unreachable records
+	let reach_stats: HashMap<String, (f64, u32, u32)> = records.iter().enumerate()
+		.filter(|(i, _)| reachable[*i])
+		.map(|(i, r)| (r.resolver.addr.ip().to_string(), (reach_latency[i], reach_attempts_used[i], reach_successes[i])))
+		.collect();
 	let mut idx = 0;
-	resolvers.retain(|_| {
+	records.retain(|_| {
 		let keep = reachable[idx];
 		idx += 1;
 		keep
 	});
-	let sidelined = before - resolvers.len();
-	println!("  {} reachable, {} sidelined, {} total", resolvers.len(), sidelined, before);
+	let sidelined = before - records.len();
+	println!("  {} reachable, {} sidelined, {} total", records.len(), sidelined, before);
 	println!();
 
 	// Phase 1: NXDOMAIN interception check
-	println!("Checking NXDOMAIN interception ({} resolvers)...", resolvers.len());
-	let phase1_total = resolvers.len();
+	println!("Checking NXDOMAIN interception ({} resolvers)...", records.len());
+	let phase1_total = records.len();
 	let phase1_done = Arc::new(AtomicUsize::new(0));
 	let phase1_start = Instant::now();
 	let monitor = spawn_progress_monitor(
@@ -597,8 +620,8 @@ pub async fn run_characterization(
 	);
 
 	let mut handles = Vec::new();
-	for (i, resolver) in resolvers.iter().enumerate() {
-		let addr = resolver.addr;
+	for (i, rec) in records.iter().enumerate() {
+		let addr = rec.resolver.addr;
 		let sem = semaphore.clone();
 		let tm = timeout;
 		let domains = nxdomain_domains.to_vec();
@@ -612,11 +635,12 @@ pub async fn run_characterization(
 		}));
 	}
 
+	let mut nxdomain_results = vec![false; records.len()];
 	let mut nxdomain_intercept_count = 0usize;
 	for handle in handles {
 		match handle.await {
 			Ok((idx, intercepts)) => {
-				resolvers[idx].intercepts_nxdomain = intercepts;
+				nxdomain_results[idx] = intercepts;
 				if intercepts { nxdomain_intercept_count += 1; }
 			}
 			Err(e) => {
@@ -626,12 +650,12 @@ pub async fn run_characterization(
 	}
 	stop_progress_monitor(monitor, "NXDOMAIN check", phase1_total, phase1_start);
 	println!("  {} intercept NXDOMAIN, {} OK",
-		nxdomain_intercept_count, resolvers.len() - nxdomain_intercept_count);
+		nxdomain_intercept_count, records.len() - nxdomain_intercept_count);
 	println!();
 
 	// Phase 2: Check rebinding protection
-	println!("Checking DNS rebinding protection ({} resolvers)...", resolvers.len());
-	let phase2_total = resolvers.len();
+	println!("Checking DNS rebinding protection ({} resolvers)...", records.len());
+	let phase2_total = records.len();
 	let phase2_done = Arc::new(AtomicUsize::new(0));
 	let phase2_start = Instant::now();
 	let monitor = spawn_progress_monitor(
@@ -639,8 +663,8 @@ pub async fn run_characterization(
 	);
 
 	let mut rebind_handles = Vec::new();
-	for (i, resolver) in resolvers.iter().enumerate() {
-		let addr = resolver.addr;
+	for (i, rec) in records.iter().enumerate() {
+		let addr = rec.resolver.addr;
 		let sem = semaphore.clone();
 		let tm = timeout;
 		let done = phase2_done.clone();
@@ -653,13 +677,14 @@ pub async fn run_characterization(
 		}));
 	}
 
+	let mut rebind_results: Vec<Option<bool>> = vec![None; records.len()];
 	let mut rebind_protected = 0usize;
 	let mut rebind_not = 0usize;
 	let mut rebind_unknown = 0usize;
 	for handle in rebind_handles {
 		match handle.await {
 			Ok((idx, protection)) => {
-				resolvers[idx].rebinding_protection = protection;
+				rebind_results[idx] = protection;
 				match protection {
 					Some(true) => rebind_protected += 1,
 					Some(false) => rebind_not += 1,
@@ -677,8 +702,8 @@ pub async fn run_characterization(
 	println!();
 
 	// Phase 3: Check DNSSEC validation
-	println!("Checking DNSSEC validation ({} resolvers)...", resolvers.len());
-	let phase3_total = resolvers.len();
+	println!("Checking DNSSEC validation ({} resolvers)...", records.len());
+	let phase3_total = records.len();
 	let phase3_done = Arc::new(AtomicUsize::new(0));
 	let phase3_start = Instant::now();
 	let monitor = spawn_progress_monitor(
@@ -686,8 +711,8 @@ pub async fn run_characterization(
 	);
 
 	let mut dnssec_handles = Vec::new();
-	for (i, resolver) in resolvers.iter().enumerate() {
-		let addr = resolver.addr;
+	for (i, rec) in records.iter().enumerate() {
+		let addr = rec.resolver.addr;
 		let sem = semaphore.clone();
 		let tm = timeout;
 		let done = phase3_done.clone();
@@ -700,13 +725,14 @@ pub async fn run_characterization(
 		}));
 	}
 
+	let mut dnssec_results: Vec<Option<bool>> = vec![None; records.len()];
 	let mut dnssec_validates = 0usize;
 	let mut dnssec_not = 0usize;
 	let mut dnssec_unknown = 0usize;
 	for handle in dnssec_handles {
 		match handle.await {
 			Ok((idx, validates)) => {
-				resolvers[idx].validates_dnssec = validates;
+				dnssec_results[idx] = validates;
 				match validates {
 					Some(true) => dnssec_validates += 1,
 					Some(false) => dnssec_not += 1,
@@ -722,23 +748,41 @@ pub async fn run_characterization(
 	println!("  {} validate, {} do not validate, {} unknown",
 		dnssec_validates, dnssec_not, dnssec_unknown);
 
-	// Log characterization summary per resolver
-	for resolver in resolvers.iter() {
-		let nxdomain_str = if resolver.intercepts_nxdomain { "intercepts" } else { "ok" };
-		let rebinding_str = match resolver.rebinding_protection {
+	// Build CharacterizationResult for each record and log telemetry
+	for (i, rec) in records.iter_mut().enumerate() {
+		let ip_str = rec.resolver.addr.ip().to_string();
+		let (lat, attempts_used, successes) = reach_stats.get(&ip_str).copied().unwrap_or((0.0, 0, 0));
+		let intercepts = nxdomain_results[i];
+		let rebinding = rebind_results[i];
+		let dnssec = dnssec_results[i];
+
+		// Write characterization result onto the record
+		rec.characterization = Some(crate::record::CharacterizationResult {
+			reachable: true,
+			attempts_used,
+			successes,
+			latency_ms: if lat > 0.0 { Some(lat) } else { None },
+			intercepts_nxdomain: intercepts,
+			rebinding_protection: rebinding,
+			validates_dnssec: dnssec,
+		});
+
+		// Log telemetry
+		let nxdomain_str = if intercepts { "intercepts" } else { "ok" };
+		let rebinding_str = match rebinding {
 			Some(true) => "protected",
 			Some(false) => "not_protected",
 			None => "unknown",
 		};
-		let dnssec_str = match resolver.validates_dnssec {
+		let dnssec_str = match dnssec {
 			Some(true) => "validates",
 			Some(false) => "no",
 			None => "unknown",
 		};
-		let class = resolver_class(resolver);
 		config.telemetry.log_characterization(
-			&resolver.addr.ip().to_string(), &resolver.label, class,
-			true, nxdomain_str, rebinding_str, dnssec_str,
+			&ip_str, &rec.resolver.label, rec.resolver.class,
+			true, lat, attempts_used, successes,
+			nxdomain_str, rebinding_str, dnssec_str,
 		);
 	}
 
@@ -750,11 +794,11 @@ pub async fn run_characterization(
 /// Phase 1: fast parallel screen with 1 query per resolver (500ms timeout).
 /// Phase 2: parallel warm-only benchmark on survivors, keep top N by p50.
 pub async fn run_discovery(
-	resolvers: &[ResolverConfig],
+	resolvers: &[Resolver],
 	categories: &std::collections::BTreeMap<String, Vec<String>>,
 	config: &BenchmarkConfig,
 	doh_clients: &DohClientPool,
-) -> Result<Vec<ResolverConfig>> {
+) -> Result<Vec<Resolver>> {
 	println!("Discovery mode: screening {} resolvers...", resolvers.len());
 
 	// Pick discovery domains from the first category with enough entries
@@ -806,15 +850,16 @@ pub async fn run_discovery(
 				Ok(b) => b,
 				Err(_) => {
 					done.fetch_add(1, Ordering::Relaxed);
-					return (resolver_clone, false, true);
+					return (resolver_clone, false, true, 0.0);
 				}
 			};
 			let result = dispatch_query(
 				&resolver_clone, &query_bytes, screen_timeout,
 				txid, &domain, QueryType::A, &doh_clients,
 			).await;
+			let latency_ms = result.latency.as_secs_f64() * 1000.0;
 			done.fetch_add(1, Ordering::Relaxed);
-			(resolver_clone, result.success, result.timeout)
+			(resolver_clone, result.success, result.timeout, latency_ms)
 		}));
 	}
 
@@ -824,19 +869,19 @@ pub async fn run_discovery(
 	let mut failed_fast = 0usize;
 	for handle in screen_handles {
 		match handle.await {
-			Ok((resolver, reachable, was_timeout)) => {
-				let class = resolver_class(&resolver);
+			Ok((resolver, reachable, was_timeout, latency_ms)) => {
+				let class = resolver.class;
 				if reachable {
 					config.telemetry.log_discovery(
 						&resolver.addr.ip().to_string(), &resolver.label,
-						class, true, "reachable",
+						class, true, "reachable", latency_ms,
 					);
 					survivors.push(resolver);
 				} else {
 					let reason = if was_timeout { "timeout" } else { "connect_failed" };
 					config.telemetry.log_discovery(
 						&resolver.addr.ip().to_string(), &resolver.label,
-						class, false, reason,
+						class, false, reason, latency_ms,
 					);
 					// Print private/system resolver failures to stdout
 					if class != "public" {
@@ -876,11 +921,11 @@ pub async fn run_discovery(
 /// and scores by median latency, variance, timeout rate, and correctness.
 /// Returns the most promising candidates up to the finalist budget.
 pub async fn run_qualification(
-	resolvers: &[ResolverConfig],
+	resolvers: &[Resolver],
 	categories: &std::collections::BTreeMap<String, Vec<String>>,
 	config: &BenchmarkConfig,
 	doh_clients: &DohClientPool,
-) -> Result<Vec<ResolverConfig>> {
+) -> Result<Vec<Resolver>> {
 	println!("Qualification pass: scoring {} resolvers...", resolvers.len());
 
 	// Build a small domain set: up to 3 cached, 5 uncached, 2 from other categories
@@ -972,23 +1017,22 @@ pub async fn run_qualification(
 	// Score each resolver: lower is better
 	// Score = median_latency + (variance_penalty) + (timeout_penalty)
 	let timeout_penalty_ms = config.timeout.as_millis() as f64;
-	let mut scored: Vec<(String, f64)> = resolver_data.iter()
+	// Score each resolver and capture components for logging
+	// Tuple: (ip, score, p50_ms, stddev_ms, timeout_rate)
+	let mut scored: Vec<(String, f64, f64, f64, f64)> = resolver_data.iter()
 		.map(|(ip, (latencies, total, timeouts))| {
 			let timeout_rate = *timeouts as f64 / *total as f64;
 			if latencies.is_empty() {
-				// No successful queries — worst score
-				return (ip.clone(), f64::INFINITY);
+				return (ip.clone(), f64::INFINITY, 0.0, 0.0, timeout_rate);
 			}
 			let mut sorted = latencies.clone();
 			sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 			let median = sorted[sorted.len() / 2];
-			// Variance: standard deviation
 			let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
 			let variance = sorted.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / sorted.len() as f64;
 			let stddev = variance.sqrt();
-			// Combined score: median + stddev + timeout penalty
 			let score = median + stddev + (timeout_rate * timeout_penalty_ms);
-			(ip.clone(), score)
+			(ip.clone(), score, median, stddev, timeout_rate)
 		})
 		.collect();
 
@@ -997,37 +1041,38 @@ pub async fn run_qualification(
 
 	// Promote up to the benchmark budget, ranked by qualification score
 	let budget = crate::transport::DEFAULT_MEDIUM_BUDGET;
-	let resolver_labels: HashMap<String, String> = resolvers.iter()
-		.map(|r| (r.addr.ip().to_string(), r.label.clone()))
+	// Build config map for metadata lookups
+	let qual_config_map: HashMap<String, &Resolver> = resolvers.iter()
+		.map(|r| (r.addr.ip().to_string(), r))
 		.collect();
 	let promote_count = scored.iter()
-		.filter(|(_, s)| s.is_finite())
+		.filter(|(_, s, _, _, _)| s.is_finite())
 		.count()
 		.min(budget);
-	// Build class map for telemetry tagging
-	let resolver_classes: HashMap<String, &str> = resolvers.iter()
-		.map(|r| (r.addr.ip().to_string(), resolver_class(r)))
-		.collect();
-	// Log all candidates with promoted flag
-	for (i, (ip, score)) in scored.iter().enumerate() {
-		let label = resolver_labels.get(ip).map(|s| s.as_str()).unwrap_or("");
-		let class = resolver_classes.get(ip).copied().unwrap_or("public");
+	// Log all candidates with promoted flag and score components
+	for (i, (ip, score, p50, stddev, timeout_rate)) in scored.iter().enumerate() {
+		let cfg = qual_config_map.get(ip);
+		let label = cfg.map(|r| r.label.as_str()).unwrap_or("");
+		let class = cfg.map(|r| r.class).unwrap_or("public");
 		let promoted = score.is_finite() && i < promote_count;
-		config.telemetry.log_qualification(ip, label, class, *score, promoted);
+		config.telemetry.log_qualification(
+			ip, label, class, *score, promoted,
+			*p50, *stddev, *timeout_rate,
+		);
 		// Print private/system resolver qualification to stdout
 		if class != "public" {
 			let status = if promoted { "promoted" } else { "not promoted" };
-			println!("  {} {} ({}) -- score {:.1}, {} (rank {}/{})",
-				class, label, ip, score, status, i + 1, scored.len());
+			println!("  {} {} ({}) -- score {:.1}, p50 {:.1} ms, {} (rank {}/{})",
+				class, label, ip, score, p50, status, i + 1, scored.len());
 		}
 	}
 	let finalist_ips: std::collections::HashSet<String> = scored.into_iter()
-		.filter(|(_, s)| s.is_finite())
+		.filter(|(_, s, _, _, _)| s.is_finite())
 		.take(promote_count)
-		.map(|(ip, _)| ip)
+		.map(|(ip, _, _, _, _)| ip)
 		.collect();
 
-	let finalists: Vec<ResolverConfig> = resolvers.iter()
+	let finalists: Vec<Resolver> = resolvers.iter()
 		.filter(|r| finalist_ips.contains(&r.addr.ip().to_string()))
 		.cloned()
 		.collect();
@@ -1038,17 +1083,57 @@ pub async fn run_qualification(
 	Ok(finalists)
 }
 
+//============================================
+/// Record-native wrapper for run_qualification.
+/// Takes Vec<ResolverRecord>, runs qualification on the resolvers,
+/// writes QualificationResult onto each record, and returns promoted records.
+pub async fn run_qualification_records(
+	mut records: Vec<crate::record::ResolverRecord>,
+	categories: &std::collections::BTreeMap<String, Vec<String>>,
+	config: &BenchmarkConfig,
+	doh_clients: &DohClientPool,
+) -> Result<Vec<crate::record::ResolverRecord>> {
+	// Extract resolvers for the existing qualification logic
+	let resolvers: Vec<Resolver> = records.iter().map(|r| r.resolver.clone()).collect();
+	let finalists = run_qualification(&resolvers, categories, config, doh_clients).await?;
+
+	// Build set of promoted IPs
+	let finalist_ips: std::collections::HashSet<String> = finalists.iter()
+		.map(|r| r.addr.ip().to_string())
+		.collect();
+
+	// Write qualification results onto records
+	for rec in records.iter_mut() {
+		let ip = rec.resolver.addr.ip().to_string();
+		let promoted = finalist_ips.contains(&ip);
+		rec.qualification = Some(crate::record::QualificationResult {
+			score: 0.0,
+			promoted,
+			p50_ms: 0.0,
+			stddev_ms: 0.0,
+			timeout_rate: 0.0,
+		});
+	}
+
+	// Filter to promoted records only
+	records.retain(|r| {
+		r.qualification.as_ref().map(|q| q.promoted).unwrap_or(false)
+	});
+
+	Ok(records)
+}
+
 /// Run a staged elimination benchmark for slow mode.
 ///
 /// Runs 2-round blocks with progressive purging of the weaker half
 /// until the finalist floor is reached, then runs remaining rounds
 /// on the final set.
 pub async fn run_staged_benchmark(
-	resolvers: &[ResolverConfig],
+	resolvers: &[Resolver],
 	categories: &std::collections::BTreeMap<String, Vec<String>>,
 	config: &BenchmarkConfig,
 	doh_clients: &DohClientPool,
-) -> Result<Vec<ScoredResolver>> {
+) -> Result<Vec<crate::record::ResolverRecord>> {
 	let purge_ratio = crate::transport::DEFAULT_SLOW_PURGE_RATIO;
 	let finalist_min = crate::transport::DEFAULT_SLOW_FINALIST_MIN;
 	let total_rounds = config.rounds;
@@ -1085,7 +1170,7 @@ pub async fn run_staged_benchmark(
 			let keep_count = target_count.max(finalist_min);
 			let keep_ips: std::collections::HashSet<String> = results.iter()
 				.take(keep_count)
-				.map(|r| r.stats.addr.clone())
+				.map(|r| r.resolver.addr.ip().to_string())
 				.collect();
 
 			let before = active_resolvers.len();
@@ -1118,11 +1203,11 @@ pub async fn run_staged_benchmark(
 /// Returns scored and ranked resolver results.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_benchmark(
-	resolvers: &[ResolverConfig],
+	resolvers: &[Resolver],
 	categories: &std::collections::BTreeMap<String, Vec<String>>,
 	config: &BenchmarkConfig,
 	doh_clients: &DohClientPool,
-) -> Result<Vec<ScoredResolver>> {
+) -> Result<Vec<crate::record::ResolverRecord>> {
 	// Determine which query types to use
 	let query_types = if config.query_aaaa {
 		vec![QueryType::A, QueryType::AAAA]
@@ -1163,9 +1248,9 @@ pub async fn run_benchmark(
 
 	// Track sidelined resolvers (by IP string)
 	let mut sidelined: std::collections::HashSet<String> = std::collections::HashSet::new();
-	// Build label map for sidelining messages
-	let label_map_for_sideline: HashMap<String, String> = resolvers.iter()
-		.map(|r| (r.addr.ip().to_string(), r.label.clone()))
+	// Build config map for sidelining messages and metadata lookups
+	let sideline_config_map: HashMap<String, &Resolver> = resolvers.iter()
+		.map(|r| (r.addr.ip().to_string(), r))
 		.collect();
 
 	for round in 0..config.rounds {
@@ -1281,15 +1366,19 @@ pub async fn run_benchmark(
 				if result.timeout { entry.2 += 1; } // timeouts
 			}
 			for (ip, (queries, successes, timeouts, latencies)) in &round_stats {
-				let p50 = if latencies.is_empty() {
-					0.0
+				let (p50, mean, stddev) = if latencies.is_empty() {
+					(0.0, 0.0, 0.0)
 				} else {
 					let mut sorted = latencies.clone();
 					sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-					sorted[sorted.len() / 2]
+					let p50 = sorted[sorted.len() / 2];
+					let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
+					let var = sorted.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / sorted.len() as f64;
+					(p50, mean, var.sqrt())
 				};
 				config.telemetry.log_round_resolver(
-					round + 1, ip, *queries, *successes, *timeouts, p50,
+					round + 1, ip, *queries, *successes, *timeouts,
+					p50, mean, stddev,
 				);
 			}
 		}
@@ -1313,8 +1402,8 @@ pub async fn run_benchmark(
 				let timeout_rate = *timeouts as f64 / *total as f64;
 				// Sideline if >80% timeouts
 				if timeout_rate > 0.8 {
-					let label = label_map_for_sideline.get(ip)
-						.cloned().unwrap_or_else(|| ip.clone());
+					let label = sideline_config_map.get(ip)
+						.map(|r| r.label.clone()).unwrap_or_else(|| ip.clone());
 					let reason = format!("{:.0}% timeouts", timeout_rate * 100.0);
 					println!("  Sidelined {} ({}) -- {}", label, ip, reason);
 					config.telemetry.log_sidelined(ip, &reason, round + 1);
@@ -1327,8 +1416,8 @@ pub async fn run_benchmark(
 					sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
 					let p50 = sorted[sorted.len() / 2];
 					if p50 > crate::transport::DEFAULT_SIDELINE_MS {
-						let label = label_map_for_sideline.get(ip)
-							.cloned().unwrap_or_else(|| ip.clone());
+						let label = sideline_config_map.get(ip)
+							.map(|r| r.label.clone()).unwrap_or_else(|| ip.clone());
 						let reason = format!("p50 {:.0} ms > {} ms threshold", p50, crate::transport::DEFAULT_SIDELINE_MS as u64);
 						println!("  Sidelined {} ({}) -- {}", label, ip, reason);
 						config.telemetry.log_sidelined(ip, &reason, round + 1);
@@ -1363,31 +1452,13 @@ pub async fn run_benchmark(
 		}
 	}
 
-	// Map resolver IP back to display label and interception status
-	let label_map: HashMap<String, String> = resolvers.iter()
-		.map(|r| (r.addr.ip().to_string(), r.label.clone()))
-		.collect();
-	let intercept_map: HashMap<String, bool> = resolvers.iter()
-		.map(|r| (r.addr.ip().to_string(), r.intercepts_nxdomain))
-		.collect();
-	let system_map: HashMap<String, bool> = resolvers.iter()
-		.map(|r| (r.addr.ip().to_string(), r.is_system))
-		.collect();
-	let transport_map: HashMap<String, String> = resolvers.iter()
-		.map(|r| (r.addr.ip().to_string(), r.transport.to_string()))
-		.collect();
-	let ptr_map: HashMap<String, Option<String>> = resolvers.iter()
-		.map(|r| (r.addr.ip().to_string(), r.ptr_name.clone()))
-		.collect();
-	let rebinding_map: HashMap<String, Option<bool>> = resolvers.iter()
-		.map(|r| (r.addr.ip().to_string(), r.rebinding_protection))
-		.collect();
-	let dnssec_map: HashMap<String, Option<bool>> = resolvers.iter()
-		.map(|r| (r.addr.ip().to_string(), r.validates_dnssec))
+	// Map resolver IP back to full config for metadata lookups
+	let config_map: HashMap<String, &Resolver> = resolvers.iter()
+		.map(|r| (r.addr.ip().to_string(), r))
 		.collect();
 
-	// Build ResolverStats for each resolver
-	let mut stats_list: Vec<ResolverStats> = Vec::new();
+	// Build ResolverRecord for each resolver with benchmark results
+	let mut records: Vec<crate::record::ResolverRecord> = Vec::new();
 	// Track all latencies per resolver for uncertainty computation
 	let mut all_latencies_per_resolver: Vec<Vec<f64>> = Vec::new();
 
@@ -1422,12 +1493,20 @@ pub async fn run_benchmark(
 			0.0
 		};
 
-		let label = label_map.get(resolver_ip)
-			.cloned()
-			.unwrap_or_else(|| resolver_ip.clone());
-		let intercepts = intercept_map.get(resolver_ip)
-			.copied()
-			.unwrap_or(false);
+		// Look up resolver config for identity
+		let resolver = config_map.get(resolver_ip)
+			.map(|r| (*r).clone())
+			.unwrap_or_else(|| {
+				// Fallback: build minimal resolver from IP string
+				{
+					let mut r = Resolver::new(
+						format!("{}:53", resolver_ip).parse().unwrap(),
+						DnsTransport::Udp,
+					);
+					r.label = resolver_ip.clone();
+					r
+				}
+			});
 
 		// Combine all latencies for uncertainty computation
 		let mut combined: Vec<f64> = Vec::new();
@@ -1436,59 +1515,39 @@ pub async fn run_benchmark(
 		}
 		all_latencies_per_resolver.push(combined);
 
-		let is_system = system_map.get(resolver_ip)
-			.copied()
-			.unwrap_or(false);
-
-		let transport_label = transport_map.get(resolver_ip)
-			.cloned()
-			.unwrap_or_else(|| "UDP".to_string());
-
-		let ptr_name = ptr_map.get(resolver_ip)
-			.cloned()
-			.unwrap_or(None);
-		let rebinding = rebinding_map.get(resolver_ip)
-			.copied()
-			.unwrap_or(None);
-		let dnssec_validates = dnssec_map.get(resolver_ip)
-			.copied()
-			.unwrap_or(None);
-
-		stats_list.push(ResolverStats {
-			label,
-			addr: resolver_ip.clone(),
-			transport: transport_label,
+		let mut record = crate::record::ResolverRecord::new(resolver);
+		record.benchmark = Some(crate::record::BenchmarkResult {
 			categories: cat_stats,
 			overall_score,
 			success_rate,
-			intercepts_nxdomain: intercepts,
-			is_system,
-			ptr_name,
-			rebinding_protection: rebinding,
-			validates_dnssec: dnssec_validates,
+			rank: 0,
+			tie_group: None,
 		});
+		records.push(record);
 	}
 
-	let mut ranked = rank_resolvers(stats_list, &config.sort_mode);
+	// Rank records by sort mode
+	rank_records(&mut records, &config.sort_mode);
 
 	// Build label-to-uncertainty map for O(1) lookup
 	let uncertainty_map: HashMap<String, f64> = resolver_data.iter()
 		.enumerate()
 		.map(|(i, (ip, _))| {
-			let label = label_map.get(ip).cloned().unwrap_or_else(|| ip.clone());
+			let label = config_map.get(ip).map(|r| r.label.clone())
+				.unwrap_or_else(|| ip.clone());
 			(label, compute_uncertainty(&all_latencies_per_resolver[i]))
 		})
 		.collect();
 
 	// Look up uncertainties in ranked order for tie detection
-	let uncertainties: Vec<f64> = ranked.iter()
-		.map(|scored| {
-			uncertainty_map.get(&scored.stats.label).copied().unwrap_or(0.0)
+	let uncertainties: Vec<f64> = records.iter()
+		.map(|rec| {
+			uncertainty_map.get(&rec.resolver.label).copied().unwrap_or(0.0)
 		})
 		.collect();
-	detect_ties(&mut ranked, &uncertainties);
+	detect_ties_on_records(&mut records, &uncertainties);
 
-	Ok(ranked)
+	Ok(records)
 }
 
 /// Per-category aggregation of query results

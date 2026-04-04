@@ -54,23 +54,22 @@ impl fmt::Display for DnsTransport {
 	}
 }
 
-/// Configuration for a single DNS resolver
+/// Canonical identity and metadata for a single DNS resolver.
+/// IP address is the true key; label is display metadata.
 #[derive(Debug, Clone)]
-pub struct ResolverConfig {
+pub struct Resolver {
 	pub label: String,
 	pub addr: SocketAddr,
 	/// Transport protocol (UDP, DoT, or DoH)
 	pub transport: DnsTransport,
-	/// Whether the resolver intercepts NXDOMAIN (set during characterization)
-	pub intercepts_nxdomain: bool,
+	/// Cached resolver classification: "system", "private", or "public"
+	pub class: &'static str,
 	/// Whether this resolver came from the system's /etc/resolv.conf
 	pub is_system: bool,
 	/// Reverse DNS (PTR) hostname for the resolver IP
 	pub ptr_name: Option<String>,
-	/// Whether the resolver protects against DNS rebinding attacks
-	pub rebinding_protection: Option<bool>,
-	/// Whether the resolver validates DNSSEC signatures
-	pub validates_dnssec: Option<bool>,
+	/// Pre-existing DNSSEC validation status from CSV metadata (not from this run)
+	pub declared_dnssec: Option<bool>,
 	/// ISO 2-letter country code from public-dns.info metadata
 	pub country_code: Option<String>,
 	/// Autonomous system organization name
@@ -80,9 +79,38 @@ pub struct ResolverConfig {
 }
 
 //============================================
+impl Resolver {
+	/// Create a new resolver with the given address and transport.
+	/// Label defaults to the IP address string. Optional fields default to None.
+	pub fn new(addr: SocketAddr, transport: DnsTransport) -> Self {
+		let mut r = Resolver {
+			label: addr.ip().to_string(),
+			addr,
+			transport,
+			class: "public",
+			is_system: false,
+			ptr_name: None,
+			declared_dnssec: None,
+			country_code: None,
+			as_org: None,
+			reliability: None,
+		};
+		r.class = resolver_class(&r);
+		r
+	}
+}
+
+//============================================
+impl std::fmt::Display for Resolver {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}", self.addr.ip())
+	}
+}
+
+//============================================
 /// Classify a resolver IP as "system", "private" (RFC1918), or "public".
-/// Used for diagnostic tagging in telemetry, not for promotion decisions.
-pub fn resolver_class(resolver: &ResolverConfig) -> &'static str {
+/// Used to compute the cached `Resolver.class` field at construction time.
+pub fn resolver_class(resolver: &Resolver) -> &'static str {
 	if resolver.is_system {
 		return "system";
 	}

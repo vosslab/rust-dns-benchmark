@@ -2,9 +2,9 @@ use std::net::SocketAddr;
 
 use anyhow::{anyhow, Result};
 
-use crate::transport::{DnsTransport, ResolverConfig};
+use crate::transport::{DnsTransport, Resolver};
 
-/// Parse a resolver address string into a ResolverConfig.
+/// Parse a resolver address string into a Resolver.
 ///
 /// Supports formats:
 ///   "1.1.1.1"                           -- UDP, default port 53
@@ -16,7 +16,7 @@ use crate::transport::{DnsTransport, ResolverConfig};
 ///   "tls://dns.google/8.8.8.8"         -- DoT with SNI hostname
 ///   "https://1.1.1.1/dns-query"        -- DoH
 ///   "https://dns.google/dns-query"     -- DoH with hostname
-pub fn parse_resolver(input: &str) -> Result<ResolverConfig> {
+pub fn parse_resolver(input: &str) -> Result<Resolver> {
 	let trimmed = input.trim();
 	if trimmed.is_empty() {
 		return Err(anyhow!("empty resolver address"));
@@ -32,18 +32,11 @@ pub fn parse_resolver(input: &str) -> Result<ResolverConfig> {
 
 	// Plain UDP resolver
 	let addr = parse_socket_addr(trimmed, 53)?;
-	let label = format!("{}", addr.ip());
-	Ok(ResolverConfig {
-		label, addr,
-		transport: DnsTransport::Udp,
-		intercepts_nxdomain: false, is_system: false,
-		ptr_name: None, rebinding_protection: None, validates_dnssec: None,
-		country_code: None, as_org: None, reliability: None,
-	})
+	Ok(Resolver::new(addr, DnsTransport::Udp))
 }
 
 /// Parse a DoH resolver URL like "https://1.1.1.1/dns-query"
-fn parse_doh_resolver(url: &str) -> Result<ResolverConfig> {
+fn parse_doh_resolver(url: &str) -> Result<Resolver> {
 	// Strip scheme to extract host and path
 	let after_scheme = &url["https://".len()..];
 
@@ -55,19 +48,13 @@ fn parse_doh_resolver(url: &str) -> Result<ResolverConfig> {
 
 	// Parse the host as an IP address for the addr field
 	let addr = parse_host_to_addr(host_port, 443)?;
-	let label = host_port.to_string();
-
-	Ok(ResolverConfig {
-		label, addr,
-		transport: DnsTransport::Doh { url: url.to_string() },
-		intercepts_nxdomain: false, is_system: false,
-		ptr_name: None, rebinding_protection: None, validates_dnssec: None,
-		country_code: None, as_org: None, reliability: None,
-	})
+	let mut r = Resolver::new(addr, DnsTransport::Doh { url: url.to_string() });
+	r.label = host_port.to_string();
+	Ok(r)
 }
 
 /// Parse a DoT resolver like "tls://1.1.1.1" or "tls://dns.google/8.8.8.8"
-fn parse_dot_resolver(input: &str) -> Result<ResolverConfig> {
+fn parse_dot_resolver(input: &str) -> Result<Resolver> {
 	let after_scheme = &input["tls://".len()..];
 
 	// Check for "hostname/IP" format for SNI + IP separation
@@ -83,14 +70,9 @@ fn parse_dot_resolver(input: &str) -> Result<ResolverConfig> {
 		(hostname.to_string(), addr)
 	};
 
-	let label = hostname.clone();
-	Ok(ResolverConfig {
-		label, addr,
-		transport: DnsTransport::Dot { hostname },
-		intercepts_nxdomain: false, is_system: false,
-		ptr_name: None, rebinding_protection: None, validates_dnssec: None,
-		country_code: None, as_org: None, reliability: None,
-	})
+	let mut r = Resolver::new(addr, DnsTransport::Dot { hostname: hostname.clone() });
+	r.label = hostname;
+	Ok(r)
 }
 
 /// Parse a host:port string to a SocketAddr, supporting IPv4, IPv6, and hostnames.
@@ -163,7 +145,7 @@ fn parse_socket_addr(input: &str, default_port: u16) -> Result<SocketAddr> {
 ///
 /// Format: "IP_ADDRESS  # Label" or "https://url  # Label"
 /// The label after '#' becomes the resolver's display name.
-fn parse_resolver_line(line: &str) -> Result<ResolverConfig> {
+fn parse_resolver_line(line: &str) -> Result<Resolver> {
 	let trimmed = line.trim();
 
 	// Split address and label, handling scheme-prefixed URLs
@@ -213,7 +195,7 @@ fn split_addr_label(line: &str) -> (&str, Option<&str>) {
 ///
 /// Blank lines and lines starting with '#' are skipped.
 /// Inline comments after the address (e.g. "1.1.1.1 # Cloudflare") set the label.
-pub fn read_resolver_file(path: &str) -> Result<Vec<ResolverConfig>> {
+pub fn read_resolver_file(path: &str) -> Result<Vec<Resolver>> {
 	let content = std::fs::read_to_string(path)
 		.map_err(|e| anyhow!("failed to read resolver file '{}': {}", path, e))?;
 	let mut resolvers = Vec::new();
@@ -231,7 +213,7 @@ pub fn read_resolver_file(path: &str) -> Result<Vec<ResolverConfig>> {
 /// Read system resolvers from /etc/resolv.conf (Unix only).
 ///
 /// Returns an empty vec on non-Unix platforms or if the file cannot be read.
-pub fn system_resolvers() -> Vec<ResolverConfig> {
+pub fn system_resolvers() -> Vec<Resolver> {
 	let content = match std::fs::read_to_string("/etc/resolv.conf") {
 		Ok(c) => c,
 		Err(_) => return Vec::new(),
@@ -249,6 +231,8 @@ pub fn system_resolvers() -> Vec<ResolverConfig> {
 				resolver.is_system = true;
 				// System resolvers are always UDP
 				resolver.transport = DnsTransport::Udp;
+				// Recompute class now that is_system is set
+				resolver.class = crate::transport::resolver_class(&resolver);
 				resolvers.push(resolver);
 			}
 		}
@@ -257,7 +241,7 @@ pub fn system_resolvers() -> Vec<ResolverConfig> {
 }
 
 /// Try to find a resolver file by name in resolvers/ dir, CWD, or exe dir.
-fn find_resolver_file(filename: &str) -> Option<Vec<ResolverConfig>> {
+fn find_resolver_file(filename: &str) -> Option<Vec<Resolver>> {
 	// Look in resolvers/ subdir first, then CWD, then next to the executable
 	let candidates = vec![
 		std::path::PathBuf::from("resolvers").join(filename),
@@ -289,65 +273,44 @@ fn find_resolver_file(filename: &str) -> Option<Vec<ResolverConfig>> {
 ///
 /// Reads from the bundled resolvers.txt at the repo root. Falls back to
 /// a minimal hardcoded list if the file cannot be found.
-pub fn default_resolvers() -> Vec<ResolverConfig> {
+pub fn default_resolvers() -> Vec<Resolver> {
 	if let Some(resolvers) = find_resolver_file("resolvers.txt") {
 		return resolvers;
 	}
 
 	// Hardcoded fallback if resolvers.txt is not found
-	vec![
-		ResolverConfig {
-			label: "Cloudflare".to_string(),
-			addr: "1.1.1.1:53".parse().unwrap(),
-			transport: DnsTransport::Udp,
-			intercepts_nxdomain: false, is_system: false,
-			ptr_name: None, rebinding_protection: None, validates_dnssec: None,
-			country_code: None, as_org: None, reliability: None,
-		},
-		ResolverConfig {
-			label: "Google".to_string(),
-			addr: "8.8.8.8:53".parse().unwrap(),
-			transport: DnsTransport::Udp,
-			intercepts_nxdomain: false, is_system: false,
-			ptr_name: None, rebinding_protection: None, validates_dnssec: None,
-			country_code: None, as_org: None, reliability: None,
-		},
-		ResolverConfig {
-			label: "Quad9".to_string(),
-			addr: "9.9.9.9:53".parse().unwrap(),
-			transport: DnsTransport::Udp,
-			intercepts_nxdomain: false, is_system: false,
-			ptr_name: None, rebinding_protection: None, validates_dnssec: None,
-			country_code: None, as_org: None, reliability: None,
-		},
-		ResolverConfig {
-			label: "OpenDNS".to_string(),
-			addr: "208.67.222.222:53".parse().unwrap(),
-			transport: DnsTransport::Udp,
-			intercepts_nxdomain: false, is_system: false,
-			ptr_name: None, rebinding_protection: None, validates_dnssec: None,
-			country_code: None, as_org: None, reliability: None,
-		},
-	]
+	let fallbacks = [
+		("Cloudflare", "1.1.1.1:53"),
+		("Google", "8.8.8.8:53"),
+		("Quad9", "9.9.9.9:53"),
+		("OpenDNS", "208.67.222.222:53"),
+	];
+	fallbacks.iter()
+		.map(|(name, addr_str)| {
+			let mut r = Resolver::new(addr_str.parse().unwrap(), DnsTransport::Udp);
+			r.label = name.to_string();
+			r
+		})
+		.collect()
 }
 
 /// Return built-in IPv6 resolvers from resolvers_ipv6.txt.
-pub fn default_ipv6_resolvers() -> Vec<ResolverConfig> {
+pub fn default_ipv6_resolvers() -> Vec<Resolver> {
 	find_resolver_file("resolvers_ipv6.txt").unwrap_or_default()
 }
 
 /// Return built-in DoH resolvers from resolvers_doh.txt.
-pub fn default_doh_resolvers() -> Vec<ResolverConfig> {
+pub fn default_doh_resolvers() -> Vec<Resolver> {
 	find_resolver_file("resolvers_doh.txt").unwrap_or_default()
 }
 
 /// Return built-in DoT resolvers from resolvers_dot.txt.
-pub fn default_dot_resolvers() -> Vec<ResolverConfig> {
+pub fn default_dot_resolvers() -> Vec<Resolver> {
 	find_resolver_file("resolvers_dot.txt").unwrap_or_default()
 }
 
 /// Return the global scan list from scan_global.txt (~63K worldwide public resolvers).
-pub fn scan_global_resolvers() -> Vec<ResolverConfig> {
+pub fn scan_global_resolvers() -> Vec<Resolver> {
 	find_resolver_file("scan_global.txt").unwrap_or_default()
 }
 
@@ -374,10 +337,10 @@ pub async fn download_global_list() -> Result<String> {
 	Ok(path)
 }
 
-/// Download nameservers.csv from public-dns.info and parse into ResolverConfigs
+/// Download nameservers.csv from public-dns.info and parse into Resolvers
 /// with rich metadata (country, AS org, DNSSEC, reliability).
 /// Filters out resolvers with reliability < 0.5.
-pub async fn download_exhaustive_csv() -> Result<Vec<ResolverConfig>> {
+pub async fn download_exhaustive_csv() -> Result<Vec<Resolver>> {
 	let url = "https://public-dns.info/nameservers.csv";
 	println!("Downloading nameserver CSV from {}...", url);
 	let response = reqwest::get(url).await
@@ -429,7 +392,7 @@ pub async fn download_exhaustive_csv() -> Result<Vec<ResolverConfig>> {
 			ip_str.to_string()
 		};
 
-		let validates_dnssec = match dnssec_str {
+		let declared_dnssec = match dnssec_str {
 			"true" => Some(true),
 			"false" => Some(false),
 			_ => None,
@@ -439,13 +402,14 @@ pub async fn download_exhaustive_csv() -> Result<Vec<ResolverConfig>> {
 		let country_code = if country.is_empty() { None } else { Some(country) };
 		let as_org = if as_org_val.is_empty() { None } else { Some(as_org_val) };
 
-		resolvers.push(ResolverConfig {
-			label, addr,
-			transport: DnsTransport::Udp,
-			intercepts_nxdomain: false, is_system: false,
-			ptr_name, rebinding_protection: None, validates_dnssec,
-			country_code, as_org, reliability: Some(reliability),
-		});
+		let mut r = Resolver::new(addr, DnsTransport::Udp);
+		r.label = label;
+		r.ptr_name = ptr_name;
+		r.declared_dnssec = declared_dnssec;
+		r.country_code = country_code;
+		r.as_org = as_org;
+		r.reliability = Some(reliability);
+		resolvers.push(r);
 	}
 
 	let ipv4_count = resolvers.iter().filter(|r| r.addr.is_ipv4()).count();

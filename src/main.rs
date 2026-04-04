@@ -4,6 +4,7 @@ mod dns;
 mod domains;
 mod output;
 mod rdns;
+mod record;
 mod resolver;
 mod stats;
 mod telemetry;
@@ -213,46 +214,69 @@ async fn run() -> anyhow::Result<()> {
 	let post_discovery_count = resolvers.len();
 	config.telemetry.log_pipeline("after_discovery", post_discovery_count);
 
+	// Wrap resolvers into records for the rest of the pipeline
+	let mut records: Vec<record::ResolverRecord> = resolvers.into_iter()
+		.map(record::ResolverRecord::new)
+		.collect();
+
 	// Run reverse DNS (PTR) lookups and NXDOMAIN interception characterization
 	let char_phase_start = std::time::Instant::now();
-	let char_before = resolvers.len();
-	rdns::resolve_ptr_names(&mut resolvers, config.timeout).await;
-	bench::run_characterization(&mut resolvers, &config, &nxdomain_domains).await;
+	let char_before = records.len();
+	rdns::resolve_ptr_records(&mut records, config.timeout).await;
+	bench::run_characterization(&mut records, &config, &nxdomain_domains).await;
 	let char_elapsed = char_phase_start.elapsed();
-	config.telemetry.log_phase("characterization", char_elapsed.as_secs(), char_before, resolvers.len());
-	phase_timings.push(("Characterization", char_elapsed, Some((char_before, resolvers.len()))));
+	config.telemetry.log_phase("characterization", char_elapsed.as_secs(), char_before, records.len());
+	phase_timings.push(("Characterization", char_elapsed, Some((char_before, records.len()))));
 
-	let post_char_count = resolvers.len();
+	let post_char_count = records.len();
 	config.telemetry.log_pipeline("after_characterization", post_char_count);
 
 	// Medium mode: run qualification pass and promote finalists
 	if level == BenchLevel::Medium {
 		let qual_start = std::time::Instant::now();
-		let qual_before = resolvers.len();
-		resolvers = bench::run_qualification(
-			&resolvers, &categories, &config, &doh_clients,
+		let qual_before = records.len();
+		records = bench::run_qualification_records(
+			records, &categories, &config, &doh_clients,
 		).await?;
-		phase_timings.push(("Qualification", qual_start.elapsed(), Some((qual_before, resolvers.len()))));
-		config.telemetry.log_pipeline("after_qualification", resolvers.len());
+		phase_timings.push(("Qualification", qual_start.elapsed(), Some((qual_before, records.len()))));
+		config.telemetry.log_pipeline("after_qualification", records.len());
 	}
 
 	// Run benchmark (slow mode uses staged elimination internally)
+	// Extract resolvers for benchmark functions (they clone internally)
+	let bench_resolvers: Vec<_> = records.iter().map(|r| r.resolver.clone()).collect();
 	println!("Running benchmark...");
 	let bench_start = std::time::Instant::now();
 	let mut results = if level == BenchLevel::Slow {
 		bench::run_staged_benchmark(
-			&resolvers, &categories, &config, &doh_clients,
+			&bench_resolvers, &categories, &config, &doh_clients,
 		).await?
 	} else {
 		bench::run_benchmark(
-			&resolvers, &categories, &config, &doh_clients,
+			&bench_resolvers, &categories, &config, &doh_clients,
 		).await?
 	};
 	phase_timings.push(("Benchmark", bench_start.elapsed(), None));
 
+	// Merge characterization data from pre-benchmark records onto benchmark results
+	// (run_benchmark creates fresh records from resolvers, losing characterization)
+	let char_map: std::collections::HashMap<String, crate::record::CharacterizationResult> = records.iter()
+		.filter_map(|r| {
+			r.characterization.clone().map(|c| (r.resolver.addr.ip().to_string(), c))
+		})
+		.collect();
+	for r in results.iter_mut() {
+		if r.characterization.is_none() {
+			let ip = r.resolver.addr.ip().to_string();
+			r.characterization = char_map.get(&ip).cloned();
+		}
+	}
+
 	// Filter out resolvers with <50% success rate (too noisy to report)
 	let before_count = results.len();
-	results.retain(|r| r.stats.success_rate >= 50.0);
+	results.retain(|r| {
+		r.benchmark.as_ref().map(|bm| bm.success_rate >= 50.0).unwrap_or(false)
+	});
 	let low_success_count = before_count - results.len();
 	if low_success_count > 0 {
 		println!(
@@ -267,7 +291,8 @@ async fn run() -> anyhow::Result<()> {
 	if let Some(ref cat_name) = first_cat {
 		let before_count = results.len();
 		results.retain(|r| {
-			r.stats.categories.get(cat_name)
+			r.benchmark.as_ref()
+				.and_then(|bm| bm.categories.get(cat_name))
 				.map(|s| s.p50_ms <= config.max_resolver_ms)
 				.unwrap_or(true)
 		});
@@ -283,33 +308,37 @@ async fn run() -> anyhow::Result<()> {
 	// Pin system resolvers to top of results
 	let (mut pinned, mut rest): (Vec<_>, Vec<_>) = results
 		.into_iter()
-		.partition(|r| r.is_system);
+		.partition(|r| r.resolver.is_system);
 	// Preserve sort order within each group
 	pinned.append(&mut rest);
 	results = pinned;
 
 	// Re-rank after filtering and pinning
 	for (i, r) in results.iter_mut().enumerate() {
-		r.rank = i + 1;
-		r.tie_group = None;
+		if let Some(ref mut bm) = r.benchmark {
+			bm.rank = i + 1;
+			bm.tie_group = None;
+		}
 	}
 
 	// Log final results to telemetry with full per-category breakdown
 	for r in &results {
-		// Build JSON object with per-category stats
-		let cat_entries: Vec<String> = r.stats.categories.iter()
-			.map(|(name, stats)| {
-				format!(
-					r#""{}": {{"p50_ms":{:.1},"score":{:.1},"success":{},"total":{},"timeouts":{}}}"#,
-					name, stats.p50_ms, stats.score, stats.success_count, stats.total_count, stats.timeout_count,
-				)
-			})
-			.collect();
-		let categories_json = format!("{{{}}}", cat_entries.join(","));
-		config.telemetry.log_result_detail(
-			r.rank, &r.stats.addr, &r.stats.label,
-			r.stats.overall_score, r.stats.success_rate, &categories_json,
-		);
+		if let Some(ref bm) = r.benchmark {
+			// Build JSON object with per-category stats
+			let cat_entries: Vec<String> = bm.categories.iter()
+				.map(|(name, stats)| {
+					format!(
+						r#""{}": {{"p50_ms":{:.1},"score":{:.1},"success":{},"total":{},"timeouts":{}}}"#,
+						name, stats.p50_ms, stats.score, stats.success_count, stats.total_count, stats.timeout_count,
+					)
+				})
+				.collect();
+			let categories_json = format!("{{{}}}", cat_entries.join(","));
+			config.telemetry.log_result_detail(
+				bm.rank, &r.resolver.addr.ip().to_string(), &r.resolver.label,
+				bm.overall_score, bm.success_rate, &categories_json,
+			);
+		}
 	}
 
 	// Print pipeline summary

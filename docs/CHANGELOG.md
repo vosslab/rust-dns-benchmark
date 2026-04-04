@@ -2,8 +2,32 @@
 
 ## 2026-04-03
 
+### Fixes and Maintenance
+- Consolidated 8 parallel HashMaps in `src/bench.rs` (label, intercept, system, transport, PTR, rebinding, DNSSEC, plus sidelining and qualification maps) into single `config_map: HashMap<String, &Resolver>` lookups; no behavioral change
+- Renamed `ResolverConfig` to `Resolver` across the codebase; IP address is the true key, labels are display metadata
+- Added `Display` impl on `Resolver` that prints IP address
+- Cached `resolver_class()` result as `Resolver.class` field at construction time; eliminated all on-demand recomputation in `src/bench.rs`
+- Created `src/record.rs` with `ResolverRecord`, `DiscoveryResult`, `CharacterizationResult`, `QualificationResult`, and `BenchmarkResult` stage result structs
+- Refactored `run_benchmark` and `run_staged_benchmark` to return `Vec<ResolverRecord>` directly
+- Migrated `src/output.rs`, `src/main.rs`, and `src/stats.rs` to consume `ResolverRecord` instead of `ScoredResolver`
+- Deleted `ResolverStats` and `ScoredResolver` structs from `src/stats.rs`; replaced by `ResolverRecord` with `BenchmarkResult`
+- Deleted `to_legacy_stats` bridge function from `src/bench.rs`
+- Replaced `rank_resolvers()` and `detect_ties()` with `rank_records()` and `detect_ties_on_records()` that operate on `Vec<ResolverRecord>` directly
+- Migrated `run_characterization` to operate on `Vec<ResolverRecord>` and write `CharacterizationResult` directly; removed transitional characterization fields from `Resolver`
+- Added `run_qualification_records` wrapper that writes `QualificationResult` onto records
+- Added `resolve_ptr_records` in `src/rdns.rs` for record-native PTR lookups
+- Pipeline in `src/main.rs` now wraps resolvers into `Vec<ResolverRecord>` after discovery and flows records through characterization, qualification, and benchmark
+- Moved `intercepts_nxdomain`, `rebinding_protection`, `validates_dnssec` off `Resolver` into `CharacterizationResult` permanently
+- Added `declared_dnssec` field on `Resolver` for CSV-provided DNSSEC metadata (separate from run-observed characterization)
+- Added `Resolver::new(addr, transport)` constructor; simplified all resolver construction sites to use it instead of verbose struct literals
+
 ### Additions and New Features
+- Characterization reachability now collects up to 3 successful latencies and reports median instead of first-success latency, producing more stable and less optimistic latency estimates
+- Added `successes` field to characterization JSONL telemetry showing how many successful responses were collected
 - Added live progress monitors with EMA-smoothed ETAs to all long-running phases: discovery screening, PTR lookups, characterization (reachability, NXDOMAIN, rebinding, DNSSEC), qualification, and benchmark rounds
+
+### Behavior or Interface Changes
+- Renamed misleading `"attempts"` JSONL telemetry field to `"attempts_used"` in characterization events; the field records which attempt succeeded, not total configured attempts
 - Added phase timing summary printed before results table showing elapsed time and resolver counts per phase
 - Extracted reusable `spawn_progress_monitor()` and `stop_progress_monitor()` helpers in `src/bench.rs`
 - ETA display uses conservative 20% padding and rounds up to reduce jitter (5s buckets under 60s, 15s buckets under 10m, 30s buckets over 10m)
