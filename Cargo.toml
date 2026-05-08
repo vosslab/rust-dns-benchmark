@@ -7,7 +7,7 @@ license = "GPL-3.0"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-hickory-proto = "0.25"
+hickory-proto = "0.26"
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 comfy-table = { version = "7", features = ["custom_styling"] }
